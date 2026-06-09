@@ -1,0 +1,26 @@
+name: Release
+
+# Publishes the pod to CocoaPods Trunk when a semver tag is pushed.
+#
+# DEFERRED UNTIL THE REPO IS PUBLIC: CocoaPods Trunk serves a public spec that
+# points at this git source, so consumers must be able to fetch it. The publish
+# step below only runs when the `COCOAPODS_TRUNK_TOKEN` secret is present, so it
+# stays dormant while the repository is private. (SwiftPM consumers just use the
+# git tag directly and need nothing here.)
+
+on:
+  push:
+    tags:
+      - '[0-9]+.[0-9]+.[0-9]+'
+
+jobs:
+  cocoapods:
+    name: Push to CocoaPods Trunk
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: pod trunk push
+        if: ${{ secrets.COCOAPODS_TRUNK_TOKEN != '' }}
+        env:
+          COCOAPODS_TRUNK_TOKEN: ${{ secrets.COCOAPODS_TRUNK_TOKEN }}
+        run: pod trunk push CatchDev.podspec --allow-warnings
