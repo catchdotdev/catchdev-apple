@@ -1,0 +1,61 @@
+# XcodeGen spec for the example app + UI test target.
+#   brew install xcodegen
+#   cd Examples && xcodegen generate
+# Produces CatchDevExample.xcodeproj wired to the local CatchDev package.
+name: CatchDevExample
+
+options:
+  bundleIdPrefix: dev.catch.example
+  deploymentTarget:
+    iOS: "16.0"
+  createIntermediateGroups: true
+
+packages:
+  CatchDev:
+    path: ..
+
+targets:
+  CatchDevExample:
+    type: application
+    platform: iOS
+    sources:
+      - CatchDevExample
+    dependencies:
+      - package: CatchDev
+        product: CatchDev
+    info:
+      path: CatchDevExample/Info.plist
+      properties:
+        UILaunchScreen: {}
+        # Allow cleartext HTTP to localhost (in-process UI-test server / local backend).
+        NSAppTransportSecurity:
+          NSAllowsLocalNetworking: true
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: dev.catch.example.app
+        MARKETING_VERSION: "1.0"
+        CURRENT_PROJECT_VERSION: "1"
+        TARGETED_DEVICE_FAMILY: "1,2"
+        GENERATE_INFOPLIST_FILE: NO
+
+  CatchDevExampleUITests:
+    type: bundle.ui-testing
+    platform: iOS
+    sources:
+      - CatchDevExampleUITests
+    dependencies:
+      - target: CatchDevExample
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: dev.catch.example.uitests
+        GENERATE_INFOPLIST_FILE: YES
+
+schemes:
+  CatchDevExample:
+    build:
+      targets:
+        CatchDevExample: all
+        CatchDevExampleUITests: [test]
+    test:
+      targets:
+        - CatchDevExampleUITests

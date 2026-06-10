@@ -3,48 +3,58 @@
 A minimal SwiftUI app that demonstrates shake-to-report, plus an XCUITest target that
 exercises the reporter end-to-end.
 
-There is no checked-in `.xcodeproj` (it's noisy to maintain). To set it up:
+> Requires **full Xcode** (not just the Command Line Tools) and an iOS Simulator runtime.
+> `swift build` works with the CLT, but running unit/UI tests needs Xcode.
 
-## 1. Create the app
+## Quick start (XcodeGen)
 
-1. In Xcode: **File → New → Project → iOS → App** (SwiftUI). Name it `CatchDevExample`.
-2. Replace the generated `App.swift` / `ContentView.swift` with the files in
-   `Examples/CatchDevExample/` and add `UITestStub.swift`.
-3. Add the package: **File → Add Package Dependencies… → Add Local…**, pick the repo
-   root, and add the `CatchDev` library to the app target.
-4. Set your access key in `CatchDevExampleApp.swift`. To test against a **local**
-   backend, pass `endpoint: URL(string: "http://localhost:4000")` and allow cleartext
-   HTTP (`NSAppTransportSecurity → NSAllowsLocalNetworking = YES` in Info.plist).
-5. Run and trigger a shake with **⌃⌘Z**, or tap *Send feedback manually*.
+The `.xcodeproj` is generated, not checked in. With [XcodeGen](https://github.com/yonaskolb/XcodeGen):
 
-## 2. Add the UI test target
+```bash
+brew install xcodegen
+cd Examples
+make test-ui        # xcodegen generate + xcodebuild test on a simulator
+```
 
-1. **File → New → Target → UI Testing Bundle**, name it `CatchDevExampleUITests`,
-   Target to be Tested = `CatchDevExample`.
-2. Replace the generated test file with
-   `Examples/CatchDevExampleUITests/CatchDevExampleUITests.swift`.
-3. Run with **⌘U** (or `xcodebuild test -scheme CatchDevExample -destination
-   'platform=iOS Simulator,name=iPhone 16'`).
+`make test-ui` generates `CatchDevExample.xcodeproj` (wired to the local `CatchDev`
+package) and runs the UI tests on `iPhone 16` (override with
+`make test-ui DESTINATION='platform=iOS Simulator,name=iPhone 15'`). `make unit` runs
+the library's unit tests from the package root.
 
-### How the e2e tests work
+To just run the app: `make generate`, then open `CatchDevExample.xcodeproj`, set your
+access key in `CatchDevExampleApp.swift`, and Run (⌘R). Trigger a shake with **⌃⌘Z**,
+or tap *Send feedback manually*.
+
+## Setting it up by hand (without XcodeGen)
+
+1. **File → New → Project → iOS → App** (SwiftUI), name `CatchDevExample`.
+2. Replace the generated files with those in `Examples/CatchDevExample/` (incl.
+   `MockFeedbackServer.swift`).
+3. **File → Add Package Dependencies… → Add Local…**, pick the repo root, add `CatchDev`.
+4. **File → New → Target → UI Testing Bundle**, name `CatchDevExampleUITests`, Target to
+   be Tested = `CatchDevExample`; replace its file with the one in
+   `Examples/CatchDevExampleUITests/`.
+5. Add `NSAppTransportSecurity → NSAllowsLocalNetworking = YES` to the app's Info.plist.
+
+## How the e2e tests work
 
 XCUITest is **black-box** (it only sees the screen), which drives three choices:
 
 - **Triggering the reporter:** there is no public API to simulate a device shake in
   XCUITest, so the test taps the app's *Send feedback manually* button (which calls
-  `CatchDev.presentReporter()`). Tag that button with
-  `.accessibilityIdentifier("example.sendFeedback")` (already done in `ContentView`).
-- **Finding controls:** the reporter's elements expose stable identifiers via
+  `CatchDev.presentReporter()`), tagged `example.sendFeedback`.
+- **Finding controls:** the reporter exposes stable identifiers via
   `CatchDevReporterAccessibility` (`catchdev.reporter.message`, `.send`, `.cancel`,
-  `.undo`, `.clear`, `.screenshot`). The tests look those up.
-- **Stubbing the network:** the app installs `UITestStub` (a `URLProtocol` returning a
-  200 for `/api/v1/feedback/report`) when launched with `-CatchDevUITest`, so the
-  Send → success → dismiss path runs without a backend. The test passes that launch
-  argument.
+  `.undo`, `.clear`, `.screenshot`).
+- **Succeeding without a backend:** under `-CatchDevUITest` the app starts an in-process
+  loopback HTTP server (`MockFeedbackServer`) and points `CatchDev` at it, so the
+  Send → success → dismiss path runs deterministically. (A real loopback server is used
+  rather than a `URLProtocol` stub because `URLSession.shared` — which the SDK uses —
+  ignores globally registered `URLProtocol` subclasses.)
 
-The provided tests cover: submit a message → reporter dismisses; cancel → reporter
-dismisses; empty message → reporter stays open.
+The provided tests cover: submit → reporter dismisses; cancel → dismisses; empty
+message → reporter stays open.
 
-> For a true full-stack e2e (SDK → real backend → dashboard), point the example app at
-> a running backend and assert the row via the dashboard's Playwright suite instead —
+> For a true full-stack e2e (SDK → real backend → dashboard), point the example app at a
+> running backend instead and assert the row with the dashboard's Playwright suite —
 > XCUITest only covers the on-device half.

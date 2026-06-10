@@ -4,9 +4,8 @@ import XCTest
 ///
 /// XCUITest is black-box: it can only see the screen, so it (a) opens the reporter via
 /// the app's manual-trigger button (there is no public API to simulate a device shake),
-/// and (b) relies on the app stubbing the network under `-CatchDevUITest` so Send
-/// succeeds deterministically. Elements are found by the accessibility identifiers in
-/// `CatchDevReporterAccessibility`.
+/// and (b) relies on the app's in-process server under `-CatchDevUITest` so Send succeeds
+/// deterministically. Elements are found by the identifiers in `CatchDevReporterAccessibility`.
 final class CatchDevExampleUITests: XCTestCase {
 
     override func setUp() {
@@ -21,13 +20,20 @@ final class CatchDevExampleUITests: XCTestCase {
         return app
     }
 
-    func testReporterSubmitsFeedback() {
-        let app = launchApp()
-
-        app.buttons["example.sendFeedback"].tap()
-
+    /// Tap the manual trigger and wait for the reporter; returns the message field.
+    @discardableResult
+    private func openReporter(_ app: XCUIApplication) -> XCUIElement {
+        let trigger = app.buttons["example.sendFeedback"]
+        XCTAssertTrue(trigger.waitForExistence(timeout: 10), "Example app should launch")
+        trigger.tap()
         let message = app.textViews["catchdev.reporter.message"]
         XCTAssertTrue(message.waitForExistence(timeout: 5), "Reporter should appear")
+        return message
+    }
+
+    func testReporterSubmitsFeedback() {
+        let app = launchApp()
+        let message = openReporter(app)
 
         message.tap()
         message.typeText("The checkout button is misaligned on small screens.")
@@ -40,10 +46,7 @@ final class CatchDevExampleUITests: XCTestCase {
 
     func testCancelDismissesReporter() {
         let app = launchApp()
-
-        app.buttons["example.sendFeedback"].tap()
-        let message = app.textViews["catchdev.reporter.message"]
-        XCTAssertTrue(message.waitForExistence(timeout: 5))
+        let message = openReporter(app)
 
         app.buttons["catchdev.reporter.cancel"].tap()
         assertDisappears(message, timeout: 5)
@@ -51,10 +54,7 @@ final class CatchDevExampleUITests: XCTestCase {
 
     func testEmptyMessageDoesNotDismiss() {
         let app = launchApp()
-
-        app.buttons["example.sendFeedback"].tap()
-        let message = app.textViews["catchdev.reporter.message"]
-        XCTAssertTrue(message.waitForExistence(timeout: 5))
+        let message = openReporter(app)
 
         // Sending with no text should be rejected (the field stays on screen).
         app.buttons["catchdev.reporter.send"].tap()
