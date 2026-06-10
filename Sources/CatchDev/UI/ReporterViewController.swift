@@ -8,12 +8,25 @@ import PencilKit
 /// never presents the reporter on top of itself.
 final class ReporterContainer: UINavigationController {}
 
+/// Stable accessibility identifiers for the reporter's controls. Shared with UI tests.
+public enum CatchDevReporterAccessibility {
+    public static let message = "catchdev.reporter.message"
+    public static let send = "catchdev.reporter.send"
+    public static let cancel = "catchdev.reporter.cancel"
+    public static let undo = "catchdev.reporter.undo"
+    public static let clear = "catchdev.reporter.clear"
+    public static let screenshot = "catchdev.reporter.screenshot"
+}
+
 /// The shake-to-report feedback sheet: an (optionally annotated) screenshot plus a
 /// message field. Built in UIKit so it presents identically from UIKit, SwiftUI and
 /// Objective-C host apps.
 final class ReporterViewController: UIViewController {
 
     private let screenshot: UIImage?
+
+    /// Called when the reporter is dismissed, so the SDK can clear its present latch.
+    var onClose: (() -> Void)?
 
     private let scrollView = UIScrollView()
     private let contentStack = UIStackView()
@@ -52,16 +65,27 @@ final class ReporterViewController: UIViewController {
         view.backgroundColor = .systemBackground
         title = "Send feedback"
 
-        navigationItem.leftBarButtonItem = UIBarButtonItem(
+        let cancelButton = UIBarButtonItem(
             barButtonSystemItem: .cancel,
             target: self,
             action: #selector(cancelTapped)
         )
+        cancelButton.accessibilityIdentifier = CatchDevReporterAccessibility.cancel
+        navigationItem.leftBarButtonItem = cancelButton
+
+        sendButton.accessibilityIdentifier = CatchDevReporterAccessibility.send
         navigationItem.rightBarButtonItem = sendButton
 
         configureLayout()
         configureAnnotation()
         observeKeyboard()
+    }
+
+    override func viewDidDisappear(_ animated: Bool) {
+        super.viewDidDisappear(animated)
+        if isBeingDismissed || (navigationController?.isBeingDismissed ?? false) {
+            onClose?()
+        }
     }
 
     // MARK: - Layout
@@ -95,6 +119,9 @@ final class ReporterViewController: UIViewController {
             imageView.image = screenshot
             imageView.contentMode = .scaleAspectFit
             imageView.translatesAutoresizingMaskIntoConstraints = false
+            imageView.isAccessibilityElement = true
+            imageView.accessibilityIdentifier = CatchDevReporterAccessibility.screenshot
+            imageView.accessibilityLabel = "Screenshot"
 
             imageContainer.translatesAutoresizingMaskIntoConstraints = false
             imageContainer.layer.cornerRadius = 8
@@ -109,9 +136,15 @@ final class ReporterViewController: UIViewController {
                 imageView.trailingAnchor.constraint(equalTo: imageContainer.trailingAnchor),
             ])
 
+            // Keep the screenshot's aspect ratio, but cap the height so a tall phone
+            // screenshot doesn't dominate the sheet and bury the message field.
             let ratio = screenshot.size.height / max(screenshot.size.width, 1)
-            imageContainer.heightAnchor
+            let aspect = imageContainer.heightAnchor
                 .constraint(equalTo: imageContainer.widthAnchor, multiplier: ratio)
+            aspect.priority = .defaultHigh
+            aspect.isActive = true
+            imageContainer.heightAnchor
+                .constraint(lessThanOrEqualToConstant: 360)
                 .isActive = true
 
             contentStack.addArrangedSubview(imageContainer)
@@ -126,6 +159,8 @@ final class ReporterViewController: UIViewController {
         messageTextView.layer.borderColor = UIColor.separator.cgColor
         messageTextView.translatesAutoresizingMaskIntoConstraints = false
         messageTextView.delegate = self
+        messageTextView.accessibilityIdentifier = CatchDevReporterAccessibility.message
+        messageTextView.accessibilityLabel = "Feedback message"
         messageTextView.heightAnchor.constraint(greaterThanOrEqualToConstant: 120).isActive = true
         contentStack.addArrangedSubview(messageTextView)
 
@@ -177,6 +212,10 @@ final class ReporterViewController: UIViewController {
             target: self,
             action: #selector(clearTapped)
         )
+        undo.accessibilityIdentifier = CatchDevReporterAccessibility.undo
+        undo.accessibilityLabel = "Undo"
+        clear.accessibilityIdentifier = CatchDevReporterAccessibility.clear
+        clear.accessibilityLabel = "Clear drawing"
         navigationItem.rightBarButtonItems = [sendButton, clear, undo]
         #endif
     }
@@ -215,8 +254,8 @@ final class ReporterViewController: UIViewController {
                 switch result {
                 case .success:
                     self.dismiss(animated: true)
-                case .failure:
-                    self.presentSendError()
+                case .failure(let error):
+                    self.presentSendError(error)
                 }
             }
         }
@@ -248,10 +287,19 @@ final class ReporterViewController: UIViewController {
         }
     }
 
-    private func presentSendError() {
+    private func presentSendError(_ error: Error) {
+        let message: String
+        switch error {
+        case CatchDevError.transport:
+            message = "Couldn’t reach the server. Check your connection and try again."
+        case CatchDevError.server(let status) where status == 401 || status == 403:
+            message = "Feedback isn’t set up correctly for this app. Please contact the developer."
+        default:
+            message = "Something went wrong. Please try again."
+        }
         let alert = UIAlertController(
             title: "Couldn’t send feedback",
-            message: "Something went wrong. Please try again.",
+            message: message,
             preferredStyle: .alert
         )
         alert.addAction(UIAlertAction(title: "OK", style: .default))

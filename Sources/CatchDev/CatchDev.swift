@@ -29,6 +29,9 @@ public final class CatchDev: NSObject {
     private var environment: String?
     private var shakeEnabled = true
     private var shakeInstalled = false
+    private var presentingReporter = false
+    private var feedbackSentHandler: ((Result<String, Error>) -> Void)?
+    private var debugLogging = false
 
     private override init() { super.init() }
 
@@ -72,6 +75,20 @@ public final class CatchDev: NSObject {
         }
     }
 
+    /// Print SDK diagnostics to the console. Off by default — useful while integrating.
+    @objc public static var isDebugLoggingEnabled: Bool {
+        get { shared.withLock { $0.debugLogging } }
+        set { shared.withLock { $0.debugLogging = newValue } }
+    }
+
+    /// Invoked on the main thread after every submission with the server report id
+    /// on success, or the error on failure. Lets integrators confirm delivery and
+    /// instrument analytics. (Swift only.)
+    public static var onFeedbackSent: ((Result<String, Error>) -> Void)? {
+        get { shared.withLock { $0.feedbackSentHandler } }
+        set { shared.withLock { $0.feedbackSentHandler = newValue } }
+    }
+
     // MARK: - Internal
 
     private func configure(apiKey: String, endpoint: URL?) {
@@ -83,7 +100,7 @@ public final class CatchDev: NSObject {
         }
         #if canImport(UIKit)
         installShakeDetectorIfNeeded()
-        ShakeDetector.shared.isEnabled = isShakeToReportEnabledValue
+        ShakeDetector.shared.isEnabled = withLock { $0.shakeEnabled }
         #endif
     }
 
@@ -93,25 +110,36 @@ public final class CatchDev: NSObject {
         imageData: Data?,
         completion: @escaping (Result<String, Error>) -> Void
     ) {
-        let snapshot = withLock { state -> (Configuration?, FeedbackUser?, [String: String], String?) in
+        let (configuration, user, metadata, environment) = withLock { state in
             (state.configuration, state.user, state.metadata, state.environment)
         }
-        guard let configuration = snapshot.0 else {
-            completion(.failure(CatchDevError.notStarted))
+        guard let configuration else {
+            let result: Result<String, Error> = .failure(CatchDevError.notStarted)
+            notifyFeedbackSent(result)
+            completion(result)
             return
         }
         var report = FeedbackReport(message: message)
-        report.email = snapshot.1?.email
-        report.userId = snapshot.1?.id
-        report.metadata = snapshot.2
-        report.environment = snapshot.3
+        report.email = user?.email
+        report.userId = user?.id
+        report.metadata = metadata
+        report.environment = environment
         report.imageData = imageData
         report.applyDeviceContext()
-        client.send(report, configuration: configuration, completion: completion)
+        client.send(report, configuration: configuration) { [weak self] result in
+            self?.notifyFeedbackSent(result)
+            completion(result)
+        }
     }
 
-    private var isShakeToReportEnabledValue: Bool {
-        withLock { $0.shakeEnabled }
+    private func notifyFeedbackSent(_ result: Result<String, Error>) {
+        guard let handler = withLock({ $0.feedbackSentHandler }) else { return }
+        DispatchQueue.main.async { handler(result) }
+    }
+
+    func log(_ message: @autoclosure () -> String) {
+        guard withLock({ $0.debugLogging }) else { return }
+        print("[CatchDev] \(message())")
     }
 
     @discardableResult
@@ -124,9 +152,10 @@ public final class CatchDev: NSObject {
     // MARK: - UI (iOS only)
 
     #if canImport(UIKit)
-    /// Manually open the feedback reporter (captures the current screen).
+    /// Open the feedback reporter manually (e.g. from a "Send feedback" button).
+    /// Safe to call from any thread — capture and presentation happen on the main thread.
     @objc public static func presentReporter() {
-        shared.presentReporter(screenshot: ScreenshotCapturer.capture())
+        shared.presentReporter()
     }
 
     private func installShakeDetectorIfNeeded() {
@@ -138,19 +167,39 @@ public final class CatchDev: NSObject {
         guard !alreadyInstalled else { return }
         ShakeDetector.shared.install()
         ShakeDetector.shared.onShake = { [weak self] in
-            self?.presentReporter(screenshot: ScreenshotCapturer.capture())
+            self?.presentReporter()
         }
     }
 
-    func presentReporter(screenshot: UIImage?) {
+    func presentReporter() {
         DispatchQueue.main.async {
-            guard self.withLock({ $0.configuration != nil }) else { return }
-            guard let presenter = UIApplication.cdv_topViewController() else { return }
-            if presenter is ReporterContainer
-                || presenter.presentedViewController is ReporterContainer {
+            guard self.withLock({ $0.configuration != nil }) else {
+                self.log("presentReporter() called before start(apiKey:) — ignored.")
                 return
             }
-            let reporter = ReporterViewController(screenshot: screenshot)
+
+            // Reject re-entrant presentation (e.g. a rapid double shake, or a shake
+            // while the reporter is already up). The latch is cleared when the
+            // reporter is dismissed (ReporterViewController.onClose).
+            let alreadyPresenting = self.withLock { state -> Bool in
+                if state.presentingReporter { return true }
+                state.presentingReporter = true
+                return false
+            }
+            guard !alreadyPresenting else { return }
+
+            guard let presenter = UIApplication.cdv_topViewController() else {
+                self.withLock { $0.presentingReporter = false }
+                self.log("presentReporter(): no view controller available to present from — ignored.")
+                return
+            }
+
+            // Capture on the main thread, immediately before presenting, so the
+            // reporter UI is not part of the screenshot.
+            let reporter = ReporterViewController(screenshot: ScreenshotCapturer.capture())
+            reporter.onClose = { [weak self] in
+                self?.withLock { $0.presentingReporter = false }
+            }
             let container = ReporterContainer(rootViewController: reporter)
             container.modalPresentationStyle = .fullScreen
             presenter.present(container, animated: true)

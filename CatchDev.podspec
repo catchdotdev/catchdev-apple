@@ -19,4 +19,5 @@ Pod::Spec.new do |spec|
   spec.swift_versions   = ['5.9']
   spec.source_files     = 'Sources/CatchDev/**/*.swift'
   spec.frameworks       = 'UIKit', 'PencilKit'
+  spec.resource_bundles = { 'CatchDev' => ['Sources/CatchDev/PrivacyInfo.xcprivacy'] }
 end

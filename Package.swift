@@ -14,7 +14,10 @@ let package = Package(
         .library(name: "CatchDev", targets: ["CatchDev"])
     ],
     targets: [
-        .target(name: "CatchDev"),
+        .target(
+            name: "CatchDev",
+            resources: [.copy("PrivacyInfo.xcprivacy")]
+        ),
         .testTarget(name: "CatchDevTests", dependencies: ["CatchDev"])
     ]
 )

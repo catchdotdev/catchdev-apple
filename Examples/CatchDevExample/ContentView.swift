@@ -19,6 +19,7 @@ struct ContentView: View {
                     CatchDev.presentReporter()
                 }
                 .buttonStyle(.borderedProminent)
+                .accessibilityIdentifier("example.sendFeedback")
             }
             .padding()
             .navigationTitle("CatchDev Example")

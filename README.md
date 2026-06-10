@@ -87,6 +87,15 @@ CatchDev.setMetadata(["screen": "Cart"])// arbitrary custom key/values
 CatchDev.setEnvironment("production")   // tag reports with an environment
 CatchDev.isShakeToReportEnabled = false // disable the shake trigger
 CatchDev.presentReporter()              // open the reporter manually (e.g. a button)
+CatchDev.isDebugLoggingEnabled = true   // print SDK diagnostics while integrating
+
+// Confirm delivery / instrument analytics (Swift only). Called on the main thread.
+CatchDev.onFeedbackSent = { result in
+    switch result {
+    case .success(let id): print("sent:", id)
+    case .failure(let error): print("failed:", error)
+    }
+}
 ```
 
 All of the above are available to Objective-C via the `CDVCatchDev` class.
