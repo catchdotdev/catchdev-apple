@@ -33,6 +33,26 @@ jobs:
             -skipMacroValidation \
             CODE_SIGNING_ALLOWED=NO
 
+  ui-tests:
+    name: UI tests (example app)
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install XcodeGen
+        run: brew install xcodegen
+      - name: Generate example project
+        working-directory: Examples
+        run: xcodegen generate
+      - name: Run UI tests
+        working-directory: Examples
+        run: |
+          xcodebuild test \
+            -project CatchDevExample.xcodeproj \
+            -scheme CatchDevExample \
+            -destination 'platform=iOS Simulator,name=iPhone 16,OS=latest' \
+            -skipMacroValidation \
+            CODE_SIGNING_ALLOWED=NO
+
   pod-lint:
     name: CocoaPods lint
     runs-on: macos-15
