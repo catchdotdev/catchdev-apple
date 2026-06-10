@@ -17,9 +17,13 @@ make test-ui        # xcodegen generate + xcodebuild test on a simulator
 ```
 
 `make test-ui` generates `CatchDevExample.xcodeproj` (wired to the local `CatchDev`
-package) and runs the UI tests on `iPhone 16` (override with
-`make test-ui DESTINATION='platform=iOS Simulator,name=iPhone 15'`). `make unit` runs
+package) and runs the UI tests on an auto-detected iPhone simulator (override with
+`make test-ui DESTINATION='platform=iOS Simulator,name=iPhone 17'`). `make unit` runs
 the library's unit tests from the package root.
+
+> Requires `xcode-select` to point at Xcode (`sudo xcode-select -s
+> /Applications/Xcode.app/Contents/Developer`), or prefix commands with
+> `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer`.
 
 To just run the app: `make generate`, then open `CatchDevExample.xcodeproj`, set your
 access key in `CatchDevExampleApp.swift`, and Run (⌘R). Trigger a shake with **⌃⌘Z**,

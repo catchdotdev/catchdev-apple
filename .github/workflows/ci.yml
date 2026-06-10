@@ -40,18 +40,10 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install XcodeGen
         run: brew install xcodegen
-      - name: Generate example project
-        working-directory: Examples
-        run: xcodegen generate
+      # Reuses Examples/Makefile, which auto-detects an available iPhone simulator.
       - name: Run UI tests
         working-directory: Examples
-        run: |
-          xcodebuild test \
-            -project CatchDevExample.xcodeproj \
-            -scheme CatchDevExample \
-            -destination 'platform=iOS Simulator,name=iPhone 16,OS=latest' \
-            -skipMacroValidation \
-            CODE_SIGNING_ALLOWED=NO
+        run: make test-ui
 
   pod-lint:
     name: CocoaPods lint
