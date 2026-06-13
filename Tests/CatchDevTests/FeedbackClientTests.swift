@@ -36,7 +36,21 @@ final class FeedbackClientTests: XCTestCase {
         XCTAssertTrue(body.contains("name=\"platform\"\r\n\r\nios"))
         XCTAssertTrue(body.contains("name=\"sdk\"\r\n\r\ncatchdev-apple"))
         XCTAssertTrue(body.contains("name=\"meta\"\r\n\r\n{\"screen\":\"Login\"}"))
+        XCTAssertTrue(body.contains("name=\"reportId\"\r\n\r\n\(report.reportId)"))
         XCTAssertTrue(body.contains("name=\"screenshot\"; filename=\"screenshot.jpg\""))
+    }
+
+    func testReportIdIsStablePerReportAndUniqueAcrossReports() {
+        let a = FeedbackReport(message: "a")
+        let b = FeedbackReport(message: "b")
+        XCTAssertFalse(a.reportId.isEmpty)
+        XCTAssertNotEqual(a.reportId, b.reportId)
+
+        // The same report encodes the same reportId every time — the retry replays it.
+        let client = FeedbackClient(boundaryProvider: { "B" })
+        let first = client.makeRequest(report: a, configuration: config)
+        let second = client.makeRequest(report: a, configuration: config)
+        XCTAssertEqual(first.httpBody, second.httpBody)
     }
 
     func testSendParsesReturnedId() {

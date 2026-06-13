@@ -20,6 +20,10 @@ struct FeedbackReport {
     var sdkVersion: String = SDKInfo.version
     var time: String = FeedbackReport.timestamp()
 
+    /// Client-generated idempotency key, stable across retries of the same report —
+    /// the server dedupes on it, so the transport-error retry can't duplicate a row.
+    var reportId: String = UUID().uuidString.lowercased()
+
     /// Arbitrary custom key/values (``CatchDev/setMetadata(_:)``). Sent as a single
     /// JSON-encoded `meta` form field.
     var metadata: [String: String] = [:]

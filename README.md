@@ -16,6 +16,10 @@ under **App → Feedback**.
 
 ## Installation
 
+> **Early access**: this repository is private during early access, so SPM resolution
+> requires repo access — contact support@catch.dev to get added. CocoaPods publishing
+> lands at public launch.
+
 ### Swift Package Manager (recommended)
 
 In Xcode: **File → Add Package Dependencies…** and enter:

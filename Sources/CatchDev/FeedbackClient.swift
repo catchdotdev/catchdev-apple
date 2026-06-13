@@ -30,6 +30,7 @@ final class FeedbackClient {
         form.addField(name: "sdk", value: report.sdk)
         form.addField(name: "sdkVersion", value: report.sdkVersion)
         form.addField(name: "time", value: report.time)
+        form.addField(name: "reportId", value: report.reportId)
         report.metadataJSONString.map { form.addField(name: "meta", value: $0) }
         if let image = report.imageData {
             form.addFile(

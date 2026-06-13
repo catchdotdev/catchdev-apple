@@ -104,10 +104,13 @@ public final class CatchDev: NSObject {
         #endif
     }
 
-    /// Assemble a report from the current context and send it.
+    /// Assemble a report from the current context and send it. `reportId` lets the
+    /// reporter reuse one idempotency key across manual "try again" attempts, so a
+    /// stored-but-unacknowledged first attempt can't be duplicated by a re-tap.
     func submit(
         message: String,
         imageData: Data?,
+        reportId: String? = nil,
         completion: @escaping (Result<String, Error>) -> Void
     ) {
         let (configuration, user, metadata, environment) = withLock { state in
@@ -120,6 +123,7 @@ public final class CatchDev: NSObject {
             return
         }
         var report = FeedbackReport(message: message)
+        if let reportId { report.reportId = reportId }
         report.email = user?.email
         report.userId = user?.id
         report.metadata = metadata
@@ -188,7 +192,10 @@ public final class CatchDev: NSObject {
             }
             guard !alreadyPresenting else { return }
 
-            guard let presenter = UIApplication.cdv_topViewController() else {
+            guard let presenter = UIApplication.cdv_topViewController(),
+                  presenter.view.window != nil,
+                  !presenter.isBeingDismissed
+            else {
                 self.withLock { $0.presentingReporter = false }
                 self.log("presentReporter(): no view controller available to present from — ignored.")
                 return
@@ -203,6 +210,18 @@ public final class CatchDev: NSObject {
             let container = ReporterContainer(rootViewController: reporter)
             container.modalPresentationStyle = .fullScreen
             presenter.present(container, animated: true)
+
+            // UIKit can reject a presentation with only a console warning (presenter
+            // already presenting, mid-transition). The reporter's deinit backstop
+            // clears the latch when that happens; this check surfaces it early. The
+            // isBeingPresented guard avoids a false release while UIKit is still
+            // setting up a deferred-but-accepted presentation.
+            DispatchQueue.main.async { [weak self] in
+                if container.presentingViewController == nil, !container.isBeingPresented {
+                    self?.withLock { $0.presentingReporter = false }
+                    self?.log("presentReporter(): UIKit did not accept the presentation — latch released.")
+                }
+            }
         }
     }
     #endif

@@ -10,7 +10,9 @@ extension UIApplication {
         let keyWindow = windowScene?.windows.first { $0.isKeyWindow } ?? windowScene?.windows.first
 
         var top = keyWindow?.rootViewController
-        while let presented = top?.presentedViewController {
+        // Stop at a presentation that is mid-dismissal: the controller above it is on
+        // its way out and presenting from it would be rejected by UIKit.
+        while let presented = top?.presentedViewController, !presented.isBeingDismissed {
             top = presented
         }
         if let navigation = top as? UINavigationController {

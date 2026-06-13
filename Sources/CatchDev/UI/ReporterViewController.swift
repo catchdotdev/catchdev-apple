@@ -25,8 +25,18 @@ final class ReporterViewController: UIViewController {
 
     private let screenshot: UIImage?
 
+    /// One idempotency key per reporter session: a manual "try again" after a failed
+    /// send replays the SAME key, so a stored-but-unacknowledged first attempt is
+    /// deduped server-side instead of creating a duplicate row.
+    private let reportId = UUID().uuidString.lowercased()
+
     /// Called when the reporter is dismissed, so the SDK can clear its present latch.
     var onClose: (() -> Void)?
+
+    /// onClose must fire exactly once, even when UIKit rejects the presentation and
+    /// the controller deallocates without ever appearing (see `deinit` backstop) —
+    /// otherwise the latch sticks and shake-to-report dies for the session.
+    private var closeNotified = false
 
     private let scrollView = UIScrollView()
     private let contentStack = UIStackView()
@@ -58,6 +68,16 @@ final class ReporterViewController: UIViewController {
 
     deinit {
         NotificationCenter.default.removeObserver(self)
+        // Backstop: if the presentation was rejected by UIKit (presenter mid-dismissal,
+        // view not in a window, scene disconnect), viewDidDisappear never fires with a
+        // dismissal flag — the dealloc is then the only signal that the latch must clear.
+        notifyClose()
+    }
+
+    private func notifyClose() {
+        guard !closeNotified else { return }
+        closeNotified = true
+        onClose?()
     }
 
     override func viewDidLoad() {
@@ -84,7 +104,7 @@ final class ReporterViewController: UIViewController {
     override func viewDidDisappear(_ animated: Bool) {
         super.viewDidDisappear(animated)
         if isBeingDismissed || (navigationController?.isBeingDismissed ?? false) {
-            onClose?()
+            notifyClose()
         }
     }
 
@@ -136,18 +156,31 @@ final class ReporterViewController: UIViewController {
                 imageView.trailingAnchor.constraint(equalTo: imageContainer.trailingAnchor),
             ])
 
-            // Keep the screenshot's aspect ratio, but cap the height so a tall phone
-            // screenshot doesn't dominate the sheet and bury the message field.
+            // Keep the screenshot's aspect ratio, cap the height so a tall phone
+            // screenshot doesn't dominate the sheet, and make the container HUG the
+            // image (centered in a wrapper) — if it stretched full-width, the canvas
+            // would accept ink in letterbox gutters that the flattened upload crops.
             let ratio = screenshot.size.height / max(screenshot.size.width, 1)
-            let aspect = imageContainer.heightAnchor
-                .constraint(equalTo: imageContainer.widthAnchor, multiplier: ratio)
-            aspect.priority = .defaultHigh
-            aspect.isActive = true
-            imageContainer.heightAnchor
-                .constraint(lessThanOrEqualToConstant: 360)
-                .isActive = true
+            let wrapper = UIView()
+            wrapper.translatesAutoresizingMaskIntoConstraints = false
+            wrapper.addSubview(imageContainer)
 
-            contentStack.addArrangedSubview(imageContainer)
+            let fullWidth = imageContainer.widthAnchor
+                .constraint(equalTo: wrapper.widthAnchor)
+            fullWidth.priority = .defaultHigh
+            NSLayoutConstraint.activate([
+                imageContainer.topAnchor.constraint(equalTo: wrapper.topAnchor),
+                imageContainer.bottomAnchor.constraint(equalTo: wrapper.bottomAnchor),
+                imageContainer.centerXAnchor.constraint(equalTo: wrapper.centerXAnchor),
+                imageContainer.widthAnchor.constraint(lessThanOrEqualTo: wrapper.widthAnchor),
+                imageContainer.heightAnchor.constraint(
+                    equalTo: imageContainer.widthAnchor, multiplier: ratio
+                ),
+                imageContainer.heightAnchor.constraint(lessThanOrEqualToConstant: 360),
+                fullWidth,
+            ])
+
+            contentStack.addArrangedSubview(wrapper)
             contentStack.addArrangedSubview(
                 makeHintLabel("Draw on the screenshot to highlight the problem.")
             )
@@ -247,7 +280,7 @@ final class ReporterViewController: UIViewController {
         setLoading(true)
 
         let imageData = composedImage()?.jpegData(compressionQuality: 0.8)
-        CatchDev.shared.submit(message: message, imageData: imageData) { [weak self] result in
+        CatchDev.shared.submit(message: message, imageData: imageData, reportId: reportId) { [weak self] result in
             DispatchQueue.main.async {
                 guard let self = self else { return }
                 self.setLoading(false)
@@ -263,15 +296,63 @@ final class ReporterViewController: UIViewController {
 
     // MARK: - Helpers
 
-    /// Flatten the displayed screenshot and any annotation into a single image.
+    /// Flatten the screenshot and any annotation into a single image at the
+    /// screenshot's NATIVE resolution. Annotation strokes live in the canvas's
+    /// on-screen coordinates (an aspect-fit display of the image), so they are
+    /// rasterized with PencilKit's CPU renderer — reliable, unlike a drawHierarchy
+    /// snapshot of the Metal-backed canvas — and mapped onto the full-size image.
+    /// Snapshotting the preview container instead would upload a ~360pt letterboxed
+    /// thumbnail with black bars.
     private func composedImage() -> UIImage? {
-        guard screenshot != nil else { return nil }
-        let bounds = imageContainer.bounds
-        guard bounds.width > 0, bounds.height > 0 else { return screenshot }
-        let renderer = UIGraphicsImageRenderer(bounds: bounds)
+        guard let screenshot = screenshot else { return nil }
+
+        #if canImport(PencilKit)
+        let drawing = canvasView.drawing
+        guard !drawing.strokes.isEmpty else { return screenshot }
+
+        let displayed = displayedImageRect()
+        guard displayed.width > 0, displayed.height > 0 else { return screenshot }
+
+        // Rasterize the strokes from the displayed rect at native pixel density.
+        let pixelScale = (screenshot.size.width * screenshot.scale) / displayed.width
+        let annotation = drawing.image(from: displayed, scale: pixelScale)
+
+        let format = UIGraphicsImageRendererFormat()
+        format.scale = screenshot.scale
+        format.opaque = true
+        let renderer = UIGraphicsImageRenderer(size: screenshot.size, format: format)
         return renderer.image { _ in
-            imageContainer.drawHierarchy(in: bounds, afterScreenUpdates: true)
+            let full = CGRect(origin: .zero, size: screenshot.size)
+            screenshot.draw(in: full)
+            annotation.draw(in: full)
         }
+        #else
+        return screenshot
+        #endif
+    }
+
+    /// The aspect-fit rect the screenshot occupies inside the image view (and the
+    /// canvas, which shares its bounds) — the coordinate space annotations are drawn in.
+    private func displayedImageRect() -> CGRect {
+        guard let screenshot = screenshot else { return .zero }
+        let bounds = imageView.bounds
+        guard bounds.width > 0, bounds.height > 0,
+              screenshot.size.width > 0, screenshot.size.height > 0
+        else { return .zero }
+        let fit = min(
+            bounds.width / screenshot.size.width,
+            bounds.height / screenshot.size.height
+        )
+        let size = CGSize(
+            width: screenshot.size.width * fit,
+            height: screenshot.size.height * fit
+        )
+        return CGRect(
+            x: bounds.midX - size.width / 2,
+            y: bounds.midY - size.height / 2,
+            width: size.width,
+            height: size.height
+        )
     }
 
     private func setLoading(_ loading: Bool) {
