@@ -20,13 +20,16 @@ public protocol CatchDevScreenNaming {
 @_spi(CatchDevTesting)
 public enum ScreenName {
     /// Resolution order: `CatchDevScreenNaming` override → `title` → unqualified class name.
+    /// Whitespace-only overrides/titles are treated as empty so they fall through to a
+    /// meaningful name rather than reporting a blank screen.
     @_spi(CatchDevTesting)
     public static func resolve(_ viewController: UIViewController) -> String {
         if let custom = (viewController as? CatchDevScreenNaming)?.catchdevScreenName,
-           !custom.isEmpty {
+           !custom.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             return custom
         }
-        if let title = viewController.title, !title.isEmpty {
+        if let title = viewController.title,
+           !title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             return title
         }
         return String(describing: type(of: viewController))

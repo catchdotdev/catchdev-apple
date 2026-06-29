@@ -2,7 +2,7 @@ import XCTest
 @_spi(CatchDevTesting) import CatchDev
 
 final class ShakeDetectorTests: XCTestCase {
-    func testDisabledDoesNotFireEnabledDoes() {
+    func testShakeFiresHandlerOnlyWhenEnabled() {
         let detector = ShakeDetector.shared
         // The app under test has already wired this singleton — save and restore it.
         let savedEnabled = detector.isEnabled

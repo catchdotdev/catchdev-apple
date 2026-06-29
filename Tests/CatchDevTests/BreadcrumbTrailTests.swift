@@ -34,6 +34,18 @@ final class BreadcrumbTrailTests: XCTestCase {
         XCTAssertTrue(trail.snapshot().isEmpty)
     }
 
+    func testCapacityOfOneKeepsOnlyTheMostRecent() {
+        var trail = BreadcrumbTrail(capacity: 1)
+        ["A", "B", "C"].forEach { trail.record(crumb($0)) }
+        XCTAssertEqual(trail.snapshot().map(\.screen), ["C"])
+    }
+
+    func testRepeatedScreenNamesAreAllKeptInOrder() {
+        var trail = BreadcrumbTrail(capacity: 5)
+        ["Home", "Detail", "Home"].forEach { trail.record(crumb($0)) }
+        XCTAssertEqual(trail.snapshot().map(\.screen), ["Home", "Detail", "Home"])
+    }
+
     func testSnapshotIsAnIndependentValueCopy() {
         var trail = BreadcrumbTrail(capacity: 5)
         trail.record(crumb("A"))

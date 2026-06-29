@@ -31,6 +31,18 @@ final class ScreenNameResolutionTests: XCTestCase {
         vc.title = "FromTitle"
         XCTAssertEqual(ScreenName.resolve(vc), "FromTitle")
     }
+
+    func testWhitespaceOnlyTitleFallsBackToClassName() {
+        let vc = BareController()
+        vc.title = "   \n\t "
+        XCTAssertEqual(ScreenName.resolve(vc), "BareController")
+    }
+
+    func testWhitespaceOnlyOverrideFallsThroughToTitle() {
+        let vc = WhitespaceNamedController()
+        vc.title = "FromTitle"
+        XCTAssertEqual(ScreenName.resolve(vc), "FromTitle")
+    }
 }
 
 private final class BareController: UIViewController {}
@@ -41,4 +53,8 @@ private final class NamedController: UIViewController, CatchDevScreenNaming {
 
 private final class EmptyNamedController: UIViewController, CatchDevScreenNaming {
     var catchdevScreenName: String? { "" }
+}
+
+private final class WhitespaceNamedController: UIViewController, CatchDevScreenNaming {
+    var catchdevScreenName: String? { "   " }
 }

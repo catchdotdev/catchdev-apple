@@ -12,7 +12,7 @@ final class DeviceContextTests: XCTestCase {
         XCTAssertFalse(DeviceContext.deviceModel.isEmpty)
     }
 
-    func testPlatformIsKnownToken() {
+    func testPlatformIsNonEmptyAndLowercased() {
         XCTAssertFalse(DeviceContext.platform.isEmpty)
         XCTAssertEqual(DeviceContext.platform.lowercased(), DeviceContext.platform)
     }

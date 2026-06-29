@@ -2,7 +2,7 @@ import Foundation
 
 /// One visited screen in the breadcrumb trail. Foundation-only and value-typed so the
 /// trail can be built and unit-tested without UIKit.
-struct Breadcrumb: Equatable {
+struct Breadcrumb: Equatable, Codable {
     /// Human-readable screen name (see `ScreenName.resolve` on iOS).
     let screen: String
     /// ISO 8601 timestamp, same format as ``FeedbackReport/time``.

@@ -1,4 +1,5 @@
 import Foundation
+import Network
 #if canImport(UIKit)
 import UIKit
 #endif
@@ -26,6 +27,11 @@ public final class CatchDev: NSObject {
     private let lock = NSLock()
     private let client: FeedbackClient
 
+    /// Durable queue for offline / background delivery. `nil` falls back to in-memory send.
+    private let outbox: FeedbackOutbox?
+    /// Whether to watch connectivity and auto-flush on reconnect (off in unit tests).
+    private let reachabilityEnabled: Bool
+
     private var configuration: Configuration?
     private var user: FeedbackUser?
     private var metadata: [String: String] = [:]
@@ -38,17 +44,26 @@ public final class CatchDev: NSObject {
     private var presentingReporter = false
     private var feedbackSentHandler: ((Result<String, Error>) -> Void)?
     private var debugLogging = false
+    private var isFlushing = false
+    private var monitorStarted = false
+    private var foregroundObserved = false
+    private var pathMonitor: NWPathMonitor?
 
     private override init() {
         self.client = FeedbackClient()
+        self.outbox = FeedbackOutbox.defaultDirectory().map { FeedbackOutbox(directory: $0) }
+        self.reachabilityEnabled = true
         super.init()
     }
 
-    /// Test seam: inject a client (e.g. one backed by `MockURLProtocol`) to drive an
-    /// instance with its own state for `submit`-level tests. Note `configure()` still wires
-    /// the process-wide UIKit singletons (shake/tracker), so UI state is not fully isolated.
-    init(client: FeedbackClient) {
+    /// Test seam: inject a client (e.g. one backed by `MockURLProtocol`) and an optional
+    /// outbox to drive an instance with its own state for `submit`-level tests. Reachability
+    /// monitoring is off by default here. Note `configure()` still wires the process-wide
+    /// UIKit singletons (shake/tracker), so UI state is not fully isolated.
+    init(client: FeedbackClient, outbox: FeedbackOutbox? = nil, monitorReachability: Bool = false) {
         self.client = client
+        self.outbox = outbox
+        self.reachabilityEnabled = monitorReachability
         super.init()
     }
 
@@ -150,12 +165,16 @@ public final class CatchDev: NSObject {
         installShakeDetectorIfNeeded()
         ShakeDetector.shared.isEnabled = withLock { $0.shakeEnabled }
         installViewControllerTrackerIfNeeded()
+        observeForegroundIfNeeded()
         #endif
+        startReachabilityMonitorIfNeeded()
+        // Deliver anything left over from a previous offline session / launch.
+        flushPending()
     }
 
-    /// Assemble a report from the current context and send it. `reportId` lets the
-    /// reporter reuse one idempotency key across manual "try again" attempts, so a
-    /// stored-but-unacknowledged first attempt can't be duplicated by a re-tap.
+    /// Assemble a report from the current context and send it. The report is durably
+    /// enqueued to the outbox FIRST, so an offline period or a crash mid-send can't lose
+    /// it — the same `reportId` is replayed on the next flush and the server dedupes on it.
     func submit(
         message: String,
         imageData: Data?,
@@ -183,10 +202,101 @@ public final class CatchDev: NSObject {
         report.breadcrumbs = breadcrumbs
         report.imageData = imageData
         report.applyDeviceContext()
-        client.send(report, configuration: configuration) { [weak self] result in
-            self?.notifyFeedbackSent(result)
-            completion(result)
+
+        // Persist before attempting the network so the report survives offline / app death.
+        var queuedDurably = false
+        if let outbox {
+            do { try outbox.enqueue(report); queuedDurably = true }
+            catch { log("outbox enqueue failed: \(error)") }
         }
+
+        client.send(report, configuration: configuration) { [weak self] result in
+            guard let self else { return }
+            switch result {
+            case .success(let id):
+                self.outbox?.remove(reportId: report.reportId)
+                self.notifyFeedbackSent(.success(id))
+                completion(.success(id))
+            case .failure(CatchDevError.server(let status)):
+                // Server rejected it (bad key, too large, …) — permanent; don't keep it.
+                self.outbox?.remove(reportId: report.reportId)
+                self.notifyFeedbackSent(.failure(CatchDevError.server(status: status)))
+                completion(.failure(CatchDevError.server(status: status)))
+            case .failure(let error):
+                if queuedDurably {
+                    // Transport/offline: it stays queued and is delivered on reconnect.
+                    // Report it accepted so the reporter dismisses; onFeedbackSent fires
+                    // later when the flush actually delivers it.
+                    self.log("submit deferred (offline) — queued \(report.reportId)")
+                    completion(.success(report.reportId))
+                } else {
+                    self.notifyFeedbackSent(.failure(error))
+                    completion(.failure(error))
+                }
+            }
+        }
+    }
+
+    /// Drain the outbox, oldest first, delivering each queued report. Delivered and
+    /// server-rejected reports are removed; on a transport failure (still offline) it stops
+    /// and leaves the rest for the next trigger. Serialized so concurrent triggers (launch,
+    /// reconnect, foreground) don't double-send.
+    func flushPending() {
+        guard let outbox else { return }
+        let configuration = withLock { $0.configuration }
+        guard let configuration else { return }
+        let shouldFlush = withLock { state -> Bool in
+            if state.isFlushing { return false }
+            state.isFlushing = true
+            return true
+        }
+        guard shouldFlush else { return }
+        flushNext(outbox.pending(), index: 0, configuration: configuration, outbox: outbox)
+    }
+
+    private func flushNext(
+        _ reports: [FeedbackReport],
+        index: Int,
+        configuration: Configuration,
+        outbox: FeedbackOutbox
+    ) {
+        guard index < reports.count else {
+            withLock { $0.isFlushing = false }
+            return
+        }
+        let report = reports[index]
+        client.send(report, configuration: configuration) { [weak self] result in
+            guard let self else { return }
+            switch result {
+            case .success(let id):
+                outbox.remove(reportId: report.reportId)
+                self.notifyFeedbackSent(.success(id))
+                self.flushNext(reports, index: index + 1, configuration: configuration, outbox: outbox)
+            case .failure(CatchDevError.server(let status)):
+                outbox.remove(reportId: report.reportId) // permanent rejection — drop it
+                self.notifyFeedbackSent(.failure(CatchDevError.server(status: status)))
+                self.flushNext(reports, index: index + 1, configuration: configuration, outbox: outbox)
+            case .failure:
+                // Still offline — stop and keep this and the remaining reports queued.
+                self.withLock { $0.isFlushing = false }
+            }
+        }
+    }
+
+    private func startReachabilityMonitorIfNeeded() {
+        guard reachabilityEnabled, outbox != nil else { return }
+        let shouldStart = withLock { state -> Bool in
+            if state.monitorStarted { return true }
+            state.monitorStarted = true
+            return false
+        }
+        guard !shouldStart else { return }
+        let monitor = NWPathMonitor()
+        monitor.pathUpdateHandler = { [weak self] path in
+            if path.status == .satisfied { self?.flushPending() }
+        }
+        monitor.start(queue: DispatchQueue(label: "dev.catch.reachability"))
+        withLock { $0.pathMonitor = monitor }
     }
 
     /// Append a visited screen to the breadcrumb trail (no-op when automatic breadcrumbs
@@ -254,6 +364,21 @@ public final class CatchDev: NSObject {
             self?.recordBreadcrumb(screen: name)
         }
         ViewControllerTracker.shared.install()
+    }
+
+    private func observeForegroundIfNeeded() {
+        let alreadyObserved = withLock { state -> Bool in
+            if state.foregroundObserved { return true }
+            state.foregroundObserved = true
+            return false
+        }
+        guard !alreadyObserved else { return }
+        // Returning to the foreground is a common moment connectivity is restored.
+        NotificationCenter.default.addObserver(
+            forName: UIApplication.didBecomeActiveNotification, object: nil, queue: nil
+        ) { [weak self] _ in
+            self?.flushPending()
+        }
     }
 
     func presentReporter() {

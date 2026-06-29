@@ -126,11 +126,120 @@ final class FeedbackClientTests: XCTestCase {
         }
         wait(for: [expectation], timeout: 5)
     }
+
+    // MARK: - Retry / transport edge cases
+
+    private func ok(_ request: URLRequest, id: String = "fb_ok") -> (HTTPURLResponse, Data) {
+        let response = HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!
+        return (response, Data("{\"id\":\"\(id)\"}".utf8))
+    }
+
+    func testTransientTransportErrorIsRetriedOnceThenSucceeds() {
+        let session = URLSession(configuration: MockURLProtocol.sessionConfiguration())
+        let attempts = AttemptCounter()
+        MockURLProtocol.handler = { request in
+            if attempts.increment() == 1 { throw URLError(.networkConnectionLost) }
+            return self.ok(request, id: "fb_retry")
+        }
+        let client = FeedbackClient(session: session, boundaryProvider: { "B" })
+        let done = expectation(description: "done")
+        client.send(FeedbackReport(message: "x"), configuration: config) { result in
+            if case .success(let id) = result { XCTAssertEqual(id, "fb_retry") }
+            else { XCTFail("expected success after retry, got \(result)") }
+            done.fulfill()
+        }
+        wait(for: [done], timeout: 5)
+        XCTAssertEqual(attempts.count, 2, "should retry exactly once")
+    }
+
+    func testTwoTransportErrorsFailAfterExactlyTwoAttempts() {
+        let session = URLSession(configuration: MockURLProtocol.sessionConfiguration())
+        let attempts = AttemptCounter()
+        MockURLProtocol.handler = { _ in
+            _ = attempts.increment()
+            throw URLError(.timedOut)
+        }
+        let client = FeedbackClient(session: session, boundaryProvider: { "B" })
+        let done = expectation(description: "done")
+        client.send(FeedbackReport(message: "x"), configuration: config) { result in
+            if case .failure(CatchDevError.transport) = result {} else {
+                XCTFail("expected transport failure, got \(result)")
+            }
+            done.fulfill()
+        }
+        wait(for: [done], timeout: 5)
+        XCTAssertEqual(attempts.count, 2, "one initial attempt + one retry, then give up")
+    }
+
+    func testServerErrorIsNotRetried() {
+        let session = URLSession(configuration: MockURLProtocol.sessionConfiguration())
+        let attempts = AttemptCounter()
+        MockURLProtocol.handler = { request in
+            _ = attempts.increment()
+            let response = HTTPURLResponse(url: request.url!, statusCode: 500, httpVersion: nil, headerFields: nil)!
+            return (response, Data())
+        }
+        let client = FeedbackClient(session: session, boundaryProvider: { "B" })
+        let done = expectation(description: "done")
+        client.send(FeedbackReport(message: "x"), configuration: config) { result in
+            if case .failure(CatchDevError.server(let status)) = result { XCTAssertEqual(status, 500) }
+            else { XCTFail("expected server error, got \(result)") }
+            done.fulfill()
+        }
+        wait(for: [done], timeout: 5)
+        XCTAssertEqual(attempts.count, 1, "server errors must not be retried")
+    }
+
+    func testSuccessWithEmptyOrMalformedBodyYieldsEmptyId() {
+        for body in ["", "not json", "{}", "{\"notid\":1}"] {
+            let session = URLSession(configuration: MockURLProtocol.sessionConfiguration())
+            MockURLProtocol.handler = { request in
+                let response = HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!
+                return (response, Data(body.utf8))
+            }
+            let client = FeedbackClient(session: session, boundaryProvider: { "B" })
+            let done = expectation(description: "done-\(body)")
+            client.send(FeedbackReport(message: "x"), configuration: config) { result in
+                if case .success(let id) = result { XCTAssertEqual(id, "", "body=\(body)") }
+                else { XCTFail("expected success for 2xx, got \(result) for body=\(body)") }
+                done.fulfill()
+            }
+            wait(for: [done], timeout: 5)
+        }
+    }
+
+    func testRetryReplaysIdenticalBodyIncludingReportId() {
+        let session = URLSession(configuration: MockURLProtocol.sessionConfiguration())
+        let attempts = AttemptCounter()
+        var bodies: [Data] = []
+        let lock = NSLock()
+        MockURLProtocol.handler = { request in
+            lock.lock()
+            if let body = request.httpBody { bodies.append(body) }
+            else if let stream = request.httpBodyStream {
+                stream.open(); defer { stream.close() }
+                var data = Data(); let size = 4096
+                let buf = UnsafeMutablePointer<UInt8>.allocate(capacity: size); defer { buf.deallocate() }
+                while stream.hasBytesAvailable { let n = stream.read(buf, maxLength: size); if n <= 0 { break }; data.append(buf, count: n) }
+                bodies.append(data)
+            }
+            lock.unlock()
+            if attempts.increment() == 1 { throw URLError(.networkConnectionLost) }
+            return self.ok(request)
+        }
+        let client = FeedbackClient(session: session, boundaryProvider: { "B" })
+        let done = expectation(description: "done")
+        client.send(FeedbackReport(message: "x"), configuration: config) { _ in done.fulfill() }
+        wait(for: [done], timeout: 5)
+        XCTAssertEqual(bodies.count, 2, "should have sent two requests")
+        XCTAssertEqual(bodies.first, bodies.last, "retry must replay the identical body (same reportId)")
+    }
 }
 
-/// In-memory URLProtocol used to stub network responses in tests.
+/// In-memory URLProtocol used to stub network responses in tests. The handler may `throw`
+/// to simulate a transport-level failure (so the client's retry path is testable).
 final class MockURLProtocol: URLProtocol {
-    static var handler: ((URLRequest) -> (HTTPURLResponse, Data))?
+    static var handler: ((URLRequest) throws -> (HTTPURLResponse, Data))?
 
     static func sessionConfiguration() -> URLSessionConfiguration {
         let configuration = URLSessionConfiguration.ephemeral
@@ -146,11 +255,24 @@ final class MockURLProtocol: URLProtocol {
             client?.urlProtocol(self, didFailWithError: NSError(domain: "MockURLProtocol", code: -1))
             return
         }
-        let (response, data) = handler(request)
-        client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
-        client?.urlProtocol(self, didLoad: data)
-        client?.urlProtocolDidFinishLoading(self)
+        do {
+            let (response, data) = try handler(request)
+            client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+            client?.urlProtocol(self, didLoad: data)
+            client?.urlProtocolDidFinishLoading(self)
+        } catch {
+            client?.urlProtocol(self, didFailWithError: error)
+        }
     }
 
     override func stopLoading() {}
+}
+
+/// Thread-safe attempt counter shared with a `MockURLProtocol` handler that runs on
+/// URLSession's background queue.
+final class AttemptCounter {
+    private let lock = NSLock()
+    private var value = 0
+    func increment() -> Int { lock.lock(); defer { lock.unlock() }; value += 1; return value }
+    var count: Int { lock.lock(); defer { lock.unlock() }; return value }
 }

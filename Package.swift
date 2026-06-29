@@ -6,9 +6,11 @@ let package = Package(
     // v1 is iOS/iPadOS only (shake-to-report + screenshot + PencilKit annotation).
     // The Foundation-only core still compiles for the host (macOS) so `swift build`
     // and `swift test` work from the command line; all UIKit code is gated behind
-    // `#if canImport(UIKit)`.
+    // `#if canImport(UIKit)`. The macOS floor is set only so that host build has the
+    // APIs the core uses (e.g. NWPathMonitor, 10.14+) available.
     platforms: [
-        .iOS(.v15)
+        .iOS(.v15),
+        .macOS(.v11)
     ],
     products: [
         .library(name: "CatchDev", targets: ["CatchDev"])

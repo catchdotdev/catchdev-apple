@@ -146,6 +146,25 @@ Notes:
 - Disable automatic breadcrumb collection with
   `CatchDev.isAutomaticBreadcrumbsEnabled = false`.
 
+## Reliability & offline delivery
+
+Submissions are durable. On **Send**, the report (and its screenshot) is written to an
+on-disk outbox in Application Support *before* the upload is attempted, so it survives
+being offline or the app being killed mid-send. The report carries a stable `reportId`
+that the server dedupes on, so replaying a "sent-but-unacknowledged" report is safe.
+
+The outbox is drained automatically when:
+- the SDK starts (`start`),
+- connectivity is restored (watched with `NWPathMonitor`), and
+- the app returns to the foreground.
+
+Delivered reports are removed; a report the server *rejects* (e.g. a bad key) is dropped
+rather than retried forever; a report that can't be sent because the device is offline
+stays queued. `onFeedbackSent` fires when a report is actually delivered. The outbox is
+bounded, so a long offline period can't grow it without limit. (This is an in-process
+outbox — it uploads while the app is running, not while suspended/terminated, which keeps
+the SDK self-contained with no host AppDelegate wiring required.)
+
 ## Privacy
 
 Screenshots are taken on-device and can contain whatever is on screen (including

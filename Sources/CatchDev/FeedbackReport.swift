@@ -2,7 +2,9 @@ import Foundation
 
 /// The payload for one user feedback submission. Mirrors the multipart fields of
 /// `POST /api/v1/feedback/report`. Foundation-only and value-typed for testability.
-struct FeedbackReport {
+/// `Codable` so a pending report can be persisted to the offline outbox — the bulky
+/// `imageData` is deliberately excluded (the outbox stores the screenshot as a side file).
+struct FeedbackReport: Codable {
     var message: String
 
     var email: String?
@@ -41,6 +43,14 @@ struct FeedbackReport {
 
     init(message: String) {
         self.message = message
+    }
+
+    /// Persisted fields. `imageData` is intentionally omitted — the outbox writes the
+    /// screenshot to a separate file rather than base64-bloating the JSON.
+    private enum CodingKeys: String, CodingKey {
+        case message, email, userId, appVersion, appBuild, osVersion, device, platform
+        case environment, screenName, locale, sdk, sdkVersion, time, reportId
+        case metadata, breadcrumbs, imageContentType
     }
 
     /// Reserved `meta` key the breadcrumb trail is serialized under.

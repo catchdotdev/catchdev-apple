@@ -37,4 +37,14 @@ final class TopViewControllerTests: XCTestCase {
     func testNilRootReturnsNil() {
         XCTAssertNil(UIApplication.cdv_topViewController(from: nil))
     }
+
+    func testEmptyNavigationReturnsTheNavigationControllerItself() {
+        let nav = UINavigationController()
+        XCTAssertTrue(UIApplication.cdv_topViewController(from: nav) === nav)
+    }
+
+    func testTabBarWithNoSelectionReturnsTheTabBarControllerItself() {
+        let tab = UITabBarController()
+        XCTAssertTrue(UIApplication.cdv_topViewController(from: tab) === tab)
+    }
 }
