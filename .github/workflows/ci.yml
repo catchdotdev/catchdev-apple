@@ -34,16 +34,29 @@ jobs:
             CODE_SIGNING_ALLOWED=NO
 
   ui-tests:
-    name: UI tests (example app)
+    name: UI tests (iOS ${{ matrix.ios }})
     runs-on: macos-15
+    strategy:
+      fail-fast: false
+      matrix:
+        # Run the UI / e2e suite on the OLDEST supported iOS (the example app's deployment
+        # floor) and the LATEST the runner image provides. Work lands on main directly
+        # (PRs are the exception here), so both legs run on every main merge.
+        ios: ['16.4', 'latest']
     steps:
       - uses: actions/checkout@v4
       - name: Install XcodeGen
         run: brew install xcodegen
-      # Reuses Examples/Makefile, which auto-detects an available iPhone simulator.
-      - name: Run UI tests
+      # Examples/Makefile + scripts/pick-simulator.sh resolve a simulator for the requested
+      # iOS — for the oldest leg that includes downloading the runtime and creating a device.
+      - name: Run UI tests (iOS ${{ matrix.ios }})
         working-directory: Examples
-        run: make test-ui
+        run: |
+          if [ "${{ matrix.ios }}" = "latest" ]; then
+            make test-ui
+          else
+            make test-ui IOS_VERSION="${{ matrix.ios }}"
+          fi
 
   pod-lint:
     name: CocoaPods lint

@@ -2,10 +2,11 @@
 # Requires full Xcode (not just the Command Line Tools, and `xcode-select` pointed at
 # it) and XcodeGen (`brew install xcodegen`).
 
-# Auto-pick the first available iPhone simulator (robust across Xcode versions: iPhone 16
-# on CI's macos image, iPhone 17 on a newer local Xcode). Override with DESTINATION=...
-SIM_ID = $(shell xcrun simctl list devices available | grep 'iPhone' | head -1 | grep -oE '[0-9A-F]{8}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{12}')
-DESTINATION ?= platform=iOS Simulator,id=$(SIM_ID)
+# Pick a simulator. By default scripts/pick-simulator.sh auto-picks the first available
+# iPhone (latest installed runtime). Set IOS_VERSION (e.g. `make test-ui IOS_VERSION=16.4`)
+# to run against a specific iOS runtime — the script installs that runtime and creates a
+# matching iPhone if needed. Override the whole thing with DESTINATION=...
+DESTINATION ?= $(shell scripts/pick-simulator.sh $(IOS_VERSION))
 
 .PHONY: generate test-ui unit clean
 
