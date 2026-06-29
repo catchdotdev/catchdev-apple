@@ -26,12 +26,13 @@ final class FeedbackClient {
         report.device.map { form.addField(name: "device", value: $0) }
         report.platform.map { form.addField(name: "platform", value: $0) }
         report.environment.map { form.addField(name: "environment", value: $0) }
+        report.screenName.map { form.addField(name: "screenName", value: $0) }
         report.locale.map { form.addField(name: "locale", value: $0) }
         form.addField(name: "sdk", value: report.sdk)
         form.addField(name: "sdkVersion", value: report.sdkVersion)
         form.addField(name: "time", value: report.time)
         form.addField(name: "reportId", value: report.reportId)
-        report.metadataJSONString.map { form.addField(name: "meta", value: $0) }
+        report.metaJSONString.map { form.addField(name: "meta", value: $0) }
         if let image = report.imageData {
             form.addFile(
                 name: "screenshot",

@@ -14,11 +14,14 @@ struct FeedbackReport {
     var device: String?
     var platform: String?
     var environment: String?
+    /// Name of the screen the reporter was opened on. Sent as the dedicated
+    /// `screenName` multipart field.
+    var screenName: String?
     var locale: String?
 
     var sdk: String = SDKInfo.name
     var sdkVersion: String = SDKInfo.version
-    var time: String = FeedbackReport.timestamp()
+    var time: String = Timestamp.now()
 
     /// Client-generated idempotency key, stable across retries of the same report —
     /// the server dedupes on it, so the transport-error retry can't duplicate a row.
@@ -28,6 +31,10 @@ struct FeedbackReport {
     /// JSON-encoded `meta` form field.
     var metadata: [String: String] = [:]
 
+    /// Automatically collected screen-visit trail. Serialized into `meta` under the
+    /// reserved key `catchdev.breadcrumbs` (the `catchdev.` namespace is reserved).
+    var breadcrumbs: [Breadcrumb] = []
+
     /// Optional annotated screenshot, already encoded (JPEG by default).
     var imageData: Data?
     var imageContentType = "image/jpeg"
@@ -36,12 +43,24 @@ struct FeedbackReport {
         self.message = message
     }
 
-    /// JSON string for the `meta` field, or `nil` when there is no custom metadata.
-    var metadataJSONString: String? {
-        guard !metadata.isEmpty else { return nil }
+    /// Reserved `meta` key the breadcrumb trail is serialized under.
+    static let breadcrumbsMetaKey = "catchdev.breadcrumbs"
+
+    /// JSON string for the `meta` field: the user's custom metadata merged with the
+    /// reserved breadcrumb trail. `nil` when there is neither. The user's own keys are
+    /// never mutated; the SDK only sets the reserved `catchdev.breadcrumbs` key. When
+    /// there are no breadcrumbs the output is byte-identical to the metadata-only JSON.
+    var metaJSONString: String? {
+        var object = metadata as [String: Any]
+        if !breadcrumbs.isEmpty {
+            object[Self.breadcrumbsMetaKey] = breadcrumbs.map {
+                ["screen": $0.screen, "time": $0.time]
+            }
+        }
+        guard !object.isEmpty else { return nil }
         guard
             let data = try? JSONSerialization.data(
-                withJSONObject: metadata,
+                withJSONObject: object,
                 options: [.sortedKeys]
             )
         else { return nil }
@@ -56,11 +75,5 @@ struct FeedbackReport {
         device = DeviceContext.deviceModel
         platform = DeviceContext.platform
         locale = DeviceContext.locale
-    }
-
-    private static func timestamp() -> String {
-        let formatter = ISO8601DateFormatter()
-        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        return formatter.string(from: Date())
     }
 }

@@ -40,6 +40,33 @@ final class FeedbackClientTests: XCTestCase {
         XCTAssertTrue(body.contains("name=\"screenshot\"; filename=\"screenshot.jpg\""))
     }
 
+    func testMakeRequestEncodesScreenNameWhenSet() {
+        let client = FeedbackClient(boundaryProvider: { "B" })
+        var report = FeedbackReport(message: "x")
+        report.screenName = "CartViewController"
+        let request = client.makeRequest(report: report, configuration: config)
+        let body = String(decoding: request.httpBody ?? Data(), as: UTF8.self)
+        XCTAssertTrue(body.contains("name=\"screenName\"\r\n\r\nCartViewController"))
+    }
+
+    func testMakeRequestOmitsScreenNameWhenNil() {
+        let client = FeedbackClient(boundaryProvider: { "B" })
+        let request = client.makeRequest(report: FeedbackReport(message: "x"), configuration: config)
+        let body = String(decoding: request.httpBody ?? Data(), as: UTF8.self)
+        XCTAssertFalse(body.contains("name=\"screenName\""))
+    }
+
+    func testMakeRequestEncodesBreadcrumbsIntoMeta() {
+        let client = FeedbackClient(boundaryProvider: { "B" })
+        var report = FeedbackReport(message: "x")
+        report.breadcrumbs = [Breadcrumb(screen: "Home", time: "t1")]
+        let request = client.makeRequest(report: report, configuration: config)
+        let body = String(decoding: request.httpBody ?? Data(), as: UTF8.self)
+        XCTAssertTrue(body.contains("name=\"meta\""))
+        XCTAssertTrue(body.contains("catchdev.breadcrumbs"))
+        XCTAssertTrue(body.contains("\"screen\":\"Home\""))
+    }
+
     func testReportIdIsStablePerReportAndUniqueAcrossReports() {
         let a = FeedbackReport(message: "a")
         let b = FeedbackReport(message: "b")

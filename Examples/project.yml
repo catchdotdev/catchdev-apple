@@ -50,12 +50,31 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: dev.catch.example.uitests
         GENERATE_INFOPLIST_FILE: YES
 
+  # White-box unit tests for the UIKit paths that `swift test` (macOS, Foundation-only)
+  # can't reach. App-hosted so UIKit is available; uses `@_spi(CatchDevTesting)` to reach
+  # SDK internals (an SPM product isn't built with -enable-testing, so @testable is unreliable).
+  CatchDevExampleUnitTests:
+    type: bundle.unit-test
+    platform: iOS
+    sources:
+      - CatchDevExampleUnitTests
+    dependencies:
+      - target: CatchDevExample
+      - package: CatchDev
+        product: CatchDev
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: dev.catch.example.unittests
+        GENERATE_INFOPLIST_FILE: YES
+
 schemes:
   CatchDevExample:
     build:
       targets:
         CatchDevExample: all
+        CatchDevExampleUnitTests: [test]
         CatchDevExampleUITests: [test]
     test:
       targets:
+        - CatchDevExampleUnitTests
         - CatchDevExampleUITests

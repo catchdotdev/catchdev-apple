@@ -25,6 +25,10 @@ final class ReporterViewController: UIViewController {
 
     private let screenshot: UIImage?
 
+    /// Name of the screen the reporter was opened on, captured at present-time and sent
+    /// as the report's `screenName`.
+    private let screenName: String?
+
     /// One idempotency key per reporter session: a manual "try again" after a failed
     /// send replays the SAME key, so a stored-but-unacknowledged first attempt is
     /// deduped server-side instead of creating a duplicate row.
@@ -56,8 +60,9 @@ final class ReporterViewController: UIViewController {
     private let canvasView = PKCanvasView()
     #endif
 
-    init(screenshot: UIImage?) {
+    init(screenshot: UIImage?, screenName: String? = nil) {
         self.screenshot = screenshot
+        self.screenName = screenName
         super.init(nibName: nil, bundle: nil)
     }
 
@@ -280,7 +285,12 @@ final class ReporterViewController: UIViewController {
         setLoading(true)
 
         let imageData = composedImage()?.jpegData(compressionQuality: 0.8)
-        CatchDev.shared.submit(message: message, imageData: imageData, reportId: reportId) { [weak self] result in
+        CatchDev.shared.submit(
+            message: message,
+            imageData: imageData,
+            reportId: reportId,
+            screenName: screenName
+        ) { [weak self] result in
             DispatchQueue.main.async {
                 guard let self = self else { return }
                 self.setLoading(false)

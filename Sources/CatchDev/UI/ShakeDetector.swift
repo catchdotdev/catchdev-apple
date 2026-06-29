@@ -3,22 +3,28 @@ import UIKit
 
 /// Detects a device shake anywhere in the host app by swizzling
 /// `UIWindow.motionEnded(_:with:)`. Installed once from ``CatchDev/start(apiKey:)``.
-final class ShakeDetector {
-    static let shared = ShakeDetector()
+@_spi(CatchDevTesting)
+public final class ShakeDetector {
+    @_spi(CatchDevTesting)
+    public static let shared = ShakeDetector()
 
-    var isEnabled = true
-    var onShake: (() -> Void)?
+    @_spi(CatchDevTesting)
+    public var isEnabled = true
+    @_spi(CatchDevTesting)
+    public var onShake: (() -> Void)?
 
     private var installed = false
     private init() {}
 
-    func install() {
+    @_spi(CatchDevTesting)
+    public func install() {
         guard !installed else { return }
         installed = true
         UIWindow.cdv_installShakeSwizzle()
     }
 
-    func handleShake() {
+    @_spi(CatchDevTesting)
+    public func handleShake() {
         guard isEnabled else { return }
         onShake?()
     }

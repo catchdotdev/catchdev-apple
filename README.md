@@ -115,9 +115,36 @@ uploads everything as `multipart/form-data` to:
 POST <endpoint>/api/v1/feedback/report
 Header: x-access-token: <apiKey>
 Fields: message, screenshot (file), email?, userId?, appVersion, appBuild,
-        osVersion, device, platform=ios, environment?, locale, sdk, sdkVersion,
-        meta (JSON), time
+        osVersion, device, platform=ios, environment?, screenName?, locale, sdk,
+        sdkVersion, meta (JSON), time
 ```
+
+## Screen name & breadcrumbs
+
+On `start`, the SDK also installs a lightweight screen tracker (by swizzling
+`UIViewController.viewDidAppear`). It records:
+
+- **`screenName`** — the screen the reporter was opened on, resolved at present-time.
+- **breadcrumbs** — a bounded trail (last 20) of recently visited screens, sent inside
+  `meta` under the reserved key `catchdev.breadcrumbs` (the `catchdev.` namespace is
+  reserved; your own `meta` keys are never touched).
+
+A screen's name is resolved as: a `CatchDevScreenNaming` override → the view
+controller's `title` → its class name. Provide an explicit, PII-free name for any screen
+whose `title` is dynamic/user-specific (e.g. a contact name):
+
+```swift
+extension CheckoutViewController: CatchDevScreenNaming {
+    var catchdevScreenName: String? { "Checkout" }
+}
+```
+
+Notes:
+- A subclass that overrides `viewDidAppear(_:)` **must call `super`** to be recorded.
+- Container controllers (navigation/tab/split/page) and framework-internal controllers
+  (the keyboard, system alerts) are filtered out automatically.
+- Disable automatic breadcrumb collection with
+  `CatchDev.isAutomaticBreadcrumbsEnabled = false`.
 
 ## Privacy
 
@@ -125,6 +152,12 @@ Screenshots are taken on-device and can contain whatever is on screen (including
 personal data). They are uploaded only when the user taps **Send**. Use
 `isShakeToReportEnabled = false` and `presentReporter()` if you want to gate when
 the reporter can appear.
+
+Screen names and the breadcrumb trail are derived from view-controller titles/class
+names. If your screen titles can contain personal data, give those screens an explicit
+name via `CatchDevScreenNaming`, or turn off automatic collection with
+`isAutomaticBreadcrumbsEnabled = false`. The SDK declares this as product-interaction
+data in its `PrivacyInfo.xcprivacy`.
 
 ## Platform support
 

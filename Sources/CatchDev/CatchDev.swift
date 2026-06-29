@@ -20,20 +20,37 @@ public final class CatchDev: NSObject {
 
     @objc public static let shared = CatchDev()
 
+    /// Number of recent screens kept in the breadcrumb trail.
+    static let breadcrumbCapacity = 20
+
     private let lock = NSLock()
-    private let client = FeedbackClient()
+    private let client: FeedbackClient
 
     private var configuration: Configuration?
     private var user: FeedbackUser?
     private var metadata: [String: String] = [:]
     private var environment: String?
+    private var breadcrumbs = BreadcrumbTrail(capacity: CatchDev.breadcrumbCapacity)
+    private var breadcrumbsEnabled = true
     private var shakeEnabled = true
     private var shakeInstalled = false
+    private var trackerInstalled = false
     private var presentingReporter = false
     private var feedbackSentHandler: ((Result<String, Error>) -> Void)?
     private var debugLogging = false
 
-    private override init() { super.init() }
+    private override init() {
+        self.client = FeedbackClient()
+        super.init()
+    }
+
+    /// Test seam: inject a client (e.g. one backed by `MockURLProtocol`) to drive an
+    /// instance with its own state for `submit`-level tests. Note `configure()` still wires
+    /// the process-wide UIKit singletons (shake/tracker), so UI state is not fully isolated.
+    init(client: FeedbackClient) {
+        self.client = client
+        super.init()
+    }
 
     // MARK: - Public API
 
@@ -51,17 +68,29 @@ public final class CatchDev: NSObject {
 
     /// Attach an end-user identity to subsequent reports.
     @objc public static func setUser(id: String?, email: String?) {
-        shared.withLock { $0.user = FeedbackUser(id: id, email: email) }
+        shared.setUser(id: id, email: email)
     }
 
     /// Attach arbitrary custom key/values to subsequent reports.
     @objc public static func setMetadata(_ metadata: [String: String]) {
-        shared.withLock { $0.metadata = metadata }
+        shared.setMetadata(metadata)
     }
 
     /// Tag reports with an environment name (e.g. `"production"`, `"staging"`).
     @objc public static func setEnvironment(_ environment: String?) {
-        shared.withLock { $0.environment = environment }
+        shared.setEnvironment(environment)
+    }
+
+    func setUser(id: String?, email: String?) {
+        withLock { $0.user = FeedbackUser(id: id, email: email) }
+    }
+
+    func setMetadata(_ metadata: [String: String]) {
+        withLock { $0.metadata = metadata }
+    }
+
+    func setEnvironment(_ environment: String?) {
+        withLock { $0.environment = environment }
     }
 
     /// Whether shaking the device opens the feedback reporter. Defaults to `true`.
@@ -75,6 +104,20 @@ public final class CatchDev: NSObject {
         }
     }
 
+    /// Whether the SDK automatically records a breadcrumb trail of visited screens (sent
+    /// inside `meta`). Defaults to `true`. Disable to stop collecting screen names — useful
+    /// if screen titles can contain personal data and you don't want to override them via
+    /// ``CatchDevScreenNaming``.
+    @objc public static var isAutomaticBreadcrumbsEnabled: Bool {
+        get { shared.isAutomaticBreadcrumbsEnabled }
+        set { shared.isAutomaticBreadcrumbsEnabled = newValue }
+    }
+
+    var isAutomaticBreadcrumbsEnabled: Bool {
+        get { withLock { $0.breadcrumbsEnabled } }
+        set { withLock { $0.breadcrumbsEnabled = newValue } }
+    }
+
     /// Print SDK diagnostics to the console. Off by default — useful while integrating.
     @objc public static var isDebugLoggingEnabled: Bool {
         get { shared.withLock { $0.debugLogging } }
@@ -85,13 +128,18 @@ public final class CatchDev: NSObject {
     /// on success, or the error on failure. Lets integrators confirm delivery and
     /// instrument analytics. (Swift only.)
     public static var onFeedbackSent: ((Result<String, Error>) -> Void)? {
-        get { shared.withLock { $0.feedbackSentHandler } }
-        set { shared.withLock { $0.feedbackSentHandler = newValue } }
+        get { shared.onFeedbackSent }
+        set { shared.onFeedbackSent = newValue }
+    }
+
+    var onFeedbackSent: ((Result<String, Error>) -> Void)? {
+        get { withLock { $0.feedbackSentHandler } }
+        set { withLock { $0.feedbackSentHandler = newValue } }
     }
 
     // MARK: - Internal
 
-    private func configure(apiKey: String, endpoint: URL?) {
+    func configure(apiKey: String, endpoint: URL?) {
         withLock {
             $0.configuration = Configuration(
                 apiKey: apiKey,
@@ -101,6 +149,7 @@ public final class CatchDev: NSObject {
         #if canImport(UIKit)
         installShakeDetectorIfNeeded()
         ShakeDetector.shared.isEnabled = withLock { $0.shakeEnabled }
+        installViewControllerTrackerIfNeeded()
         #endif
     }
 
@@ -111,10 +160,12 @@ public final class CatchDev: NSObject {
         message: String,
         imageData: Data?,
         reportId: String? = nil,
+        screenName: String? = nil,
         completion: @escaping (Result<String, Error>) -> Void
     ) {
-        let (configuration, user, metadata, environment) = withLock { state in
-            (state.configuration, state.user, state.metadata, state.environment)
+        let (configuration, user, metadata, environment, breadcrumbs) = withLock { state in
+            (state.configuration, state.user, state.metadata, state.environment,
+             state.breadcrumbs.snapshot())
         }
         guard let configuration else {
             let result: Result<String, Error> = .failure(CatchDevError.notStarted)
@@ -128,11 +179,24 @@ public final class CatchDev: NSObject {
         report.userId = user?.id
         report.metadata = metadata
         report.environment = environment
+        report.screenName = screenName
+        report.breadcrumbs = breadcrumbs
         report.imageData = imageData
         report.applyDeviceContext()
         client.send(report, configuration: configuration) { [weak self] result in
             self?.notifyFeedbackSent(result)
             completion(result)
+        }
+    }
+
+    /// Append a visited screen to the breadcrumb trail (no-op when automatic breadcrumbs
+    /// are disabled). Thread-safe; the screen name is resolved by the caller (UIKit) so no
+    /// UIKit work happens inside the lock.
+    func recordBreadcrumb(screen: String) {
+        let crumb = Breadcrumb(screen: screen, time: Timestamp.now())
+        withLock { state in
+            guard state.breadcrumbsEnabled else { return }
+            state.breadcrumbs.record(crumb)
         }
     }
 
@@ -175,6 +239,23 @@ public final class CatchDev: NSObject {
         }
     }
 
+    private func installViewControllerTrackerIfNeeded() {
+        let alreadyInstalled = withLock { state -> Bool in
+            if state.trackerInstalled { return true }
+            state.trackerInstalled = true
+            return false
+        }
+        guard !alreadyInstalled else { return }
+        // Set the handler BEFORE installing the swizzle so the first screen's appearance
+        // (which can fire synchronously as the window is made key) is never missed.
+        ViewControllerTracker.shared.onAppear = { [weak self] viewController in
+            // Resolve the name (UIKit, main thread) BEFORE entering the lock.
+            let name = ScreenName.resolve(viewController)
+            self?.recordBreadcrumb(screen: name)
+        }
+        ViewControllerTracker.shared.install()
+    }
+
     func presentReporter() {
         DispatchQueue.main.async {
             guard self.withLock({ $0.configuration != nil }) else {
@@ -202,8 +283,13 @@ public final class CatchDev: NSObject {
             }
 
             // Capture on the main thread, immediately before presenting, so the
-            // reporter UI is not part of the screenshot.
-            let reporter = ReporterViewController(screenshot: ScreenshotCapturer.capture())
+            // reporter UI is not part of the screenshot. Resolve the screen name from
+            // the SAME presenter now — at submit-time the top VC is the reporter itself.
+            let screenName = ScreenName.resolve(presenter)
+            let reporter = ReporterViewController(
+                screenshot: ScreenshotCapturer.capture(),
+                screenName: screenName
+            )
             reporter.onClose = { [weak self] in
                 self?.withLock { $0.presentingReporter = false }
             }
