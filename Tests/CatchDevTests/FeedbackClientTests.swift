@@ -67,6 +67,64 @@ final class FeedbackClientTests: XCTestCase {
         XCTAssertTrue(body.contains("\"screen\":\"Home\""))
     }
 
+    func testMakeRequestEncodesTypeSeverityAreaAndAttachments() {
+        let client = FeedbackClient(boundaryProvider: { "B" })
+        var report = FeedbackReport(message: "Crash on launch")
+        report.type = .bug
+        report.severity = .blocks
+        report.area = "Payments"
+        report.attachments = [
+            Attachment(
+                key: "feedback/uploads/a.png", kind: .screenshot,
+                contentType: "image/png", size: 12, filename: "a.png", annotated: true
+            ),
+            Attachment(
+                key: "feedback/uploads/b.mp4", kind: .recording,
+                contentType: "video/mp4", size: 99, filename: "b.mp4", annotated: nil
+            ),
+        ]
+        let request = client.makeRequest(report: report, configuration: config)
+        let body = String(decoding: request.httpBody ?? Data(), as: UTF8.self)
+        XCTAssertTrue(body.contains("name=\"type\"\r\n\r\nbug"))
+        XCTAssertTrue(body.contains("name=\"severity\"\r\n\r\nblocks"))
+        XCTAssertTrue(body.contains("name=\"area\"\r\n\r\nPayments"))
+        XCTAssertTrue(body.contains("name=\"attachments\""))
+        // JSONEncoder escapes slashes, so assert on slash-free tokens.
+        XCTAssertTrue(body.contains("a.png"))
+        XCTAssertTrue(body.contains("\"kind\":\"screenshot\""))
+        XCTAssertTrue(body.contains("b.mp4"))
+        XCTAssertTrue(body.contains("\"kind\":\"recording\""))
+    }
+
+    func testMakeRequestAlwaysSendsTypeAndOmitsUnsetOptionalFields() {
+        let client = FeedbackClient(boundaryProvider: { "B" })
+        let request = client.makeRequest(report: FeedbackReport(message: "x"), configuration: config)
+        let body = String(decoding: request.httpBody ?? Data(), as: UTF8.self)
+        XCTAssertTrue(body.contains("name=\"type\"\r\n\r\nfeedback"))
+        XCTAssertFalse(body.contains("name=\"severity\""))
+        XCTAssertFalse(body.contains("name=\"area\""))
+        XCTAssertFalse(body.contains("name=\"attachments\""))
+    }
+
+    func testMakeRequestEncodesSessionIdAndFailedRequestsIntoMeta() {
+        let client = FeedbackClient(boundaryProvider: { "B" })
+        var report = FeedbackReport(message: "x")
+        report.sessionId = "ses_abc123"
+        report.failedRequests = [FailedRequest(method: "POST", url: "https://api.x/charge", status: 500)]
+        let request = client.makeRequest(report: report, configuration: config)
+        let body = String(decoding: request.httpBody ?? Data(), as: UTF8.self)
+        XCTAssertTrue(body.contains("catchdev.sessionId"))
+        XCTAssertTrue(body.contains("ses_abc123"))
+        XCTAssertTrue(body.contains("catchdev.failedRequests"))
+        XCTAssertTrue(body.contains("\"status\":500"))
+    }
+
+    func testMakeRequestSetsInternalHeaderSoCaptureIgnoresOwnTraffic() {
+        let client = FeedbackClient(boundaryProvider: { "B" })
+        let request = client.makeRequest(report: FeedbackReport(message: "x"), configuration: config)
+        XCTAssertEqual(request.value(forHTTPHeaderField: catchDevInternalHeader), "1")
+    }
+
     func testReportIdIsStablePerReportAndUniqueAcrossReports() {
         let a = FeedbackReport(message: "a")
         let b = FeedbackReport(message: "b")

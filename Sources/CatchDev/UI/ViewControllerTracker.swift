@@ -41,7 +41,9 @@ public final class ViewControllerTracker {
             || viewController is UIPageViewController {
             return true
         }
-        if viewController is ReporterViewController || viewController is ReporterContainer {
+        if viewController is ReporterViewController
+            || viewController is ReporterContainer
+            || viewController is AnnotateViewController {
             return true
         }
         if isSystemController(viewController) {

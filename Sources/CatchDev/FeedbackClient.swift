@@ -18,6 +18,10 @@ final class FeedbackClient {
     func makeRequest(report: FeedbackReport, configuration: Configuration) -> URLRequest {
         var form = MultipartFormData(boundary: boundaryProvider())
         form.addField(name: "message", value: report.message)
+        form.addField(name: "type", value: report.type.rawValue)
+        report.severity.map { form.addField(name: "severity", value: $0.rawValue) }
+        report.area.map { form.addField(name: "area", value: $0) }
+        report.attachmentsJSONString.map { form.addField(name: "attachments", value: $0) }
         report.email.map { form.addField(name: "email", value: $0) }
         report.userId.map { form.addField(name: "userId", value: $0) }
         report.appVersion.map { form.addField(name: "appVersion", value: $0) }
@@ -47,6 +51,7 @@ final class FeedbackClient {
         request.httpMethod = "POST"
         request.setValue(configuration.apiKey, forHTTPHeaderField: "x-access-token")
         request.setValue(form.contentTypeHeader, forHTTPHeaderField: "Content-Type")
+        request.setValue("1", forHTTPHeaderField: catchDevInternalHeader)
         request.httpBody = form.encoded()
         return request
     }

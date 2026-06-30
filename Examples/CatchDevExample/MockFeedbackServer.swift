@@ -3,29 +3,38 @@ import Network
 
 /// A tiny in-process HTTP server used by the UI tests so `CatchDev` submissions succeed
 /// deterministically without a real backend. The example app starts it under the
-/// `-CatchDevUITest` launch argument and points `CatchDev` at `http://localhost:<port>`.
+/// `-CatchDevUITest` launch argument and points `CatchDev` at `http://127.0.0.1:<port>`.
 ///
-/// We run a real loopback server rather than stubbing `URLProtocol`, because
-/// `URLSession.shared` — which the SDK uses — does not consult globally registered
-/// `URLProtocol` subclasses. This also exercises the real networking path. Beyond
-/// replying 200, it parses the multipart body and reports the `screenName` and breadcrumb
-/// trail it received, so the UI tests can assert what the SDK actually sent.
+/// It routes the three requests the new reporter makes:
+///   • `POST /api/v1/feedback/upload-url` → mint a (loopback) presigned URL + key
+///   • `PUT  /upload/...`                 → accept the attachment bytes (200)
+///   • `POST /api/v1/feedback/report`     → parse the multipart and reply `{ id }`
+/// then surfaces the parsed report to the debug probe so the UI tests can assert exactly
+/// what the SDK sent (type, severity, area, contact, attachment count, breadcrumbs, …).
 final class MockFeedbackServer {
     struct ReceivedRequest {
         let screenName: String?
         let breadcrumbs: [String]
         let message: String?
+        let type: String?
+        let severity: String?
+        let area: String?
+        let email: String?
+        let attachmentCount: Int
+        let sessionId: String?
     }
 
     static let shared = MockFeedbackServer()
 
-    /// Invoked (on a background queue) once a full request has been received and parsed.
+    /// Invoked (on a background queue) once a full `/feedback/report` has been parsed.
     var onRequestReceived: ((ReceivedRequest) -> Void)?
+
+    /// Invoked (on a background queue) for EVERY request, for test diagnostics.
+    var onAnyRequest: ((_ method: String, _ path: String) -> Void)?
 
     private var listener: NWListener?
     private(set) var port: UInt16 = 0
 
-    /// Starts the server and returns the bound port (0 if it failed to start).
     @discardableResult
     func start() -> UInt16 {
         guard listener == nil else { return port }
@@ -34,6 +43,12 @@ final class MockFeedbackServer {
             listener.newConnectionHandler = { [weak self] connection in
                 connection.start(queue: .global())
                 self?.receive(on: connection, buffer: Data())
+                // Safety net: URLSession opens speculative loopback connections that send
+                // no data; left open, the receive on them never completes and they pile up
+                // across many sends until the listener stops servicing real requests (a
+                // hang with no error). Force-close every connection after a few seconds —
+                // far longer than any real request needs.
+                DispatchQueue.global().asyncAfter(deadline: .now() + 6) { connection.cancel() }
             }
             let ready = DispatchSemaphore(value: 0)
             listener.stateUpdateHandler = { [weak self] state in
@@ -53,8 +68,6 @@ final class MockFeedbackServer {
 
     // MARK: - Receiving
 
-    /// Accumulate bytes until the full body (per `Content-Length`) has arrived — a JPEG
-    /// screenshot easily spans multiple TCP segments — then parse and reply.
     private func receive(on connection: NWConnection, buffer: Data) {
         connection.receive(minimumIncompleteLength: 1, maximumLength: 1 << 20) { [weak self] data, _, isComplete, error in
             guard let self = self else { return }
@@ -62,16 +75,31 @@ final class MockFeedbackServer {
             if let data = data, !data.isEmpty { buffer.append(data) }
 
             if self.isBodyComplete(buffer) || isComplete || error != nil {
-                self.handle(request: buffer)
-                self.sendOK(on: connection)
+                self.respond(on: connection, to: buffer)
             } else {
                 self.receive(on: connection, buffer: buffer)
             }
         }
     }
 
-    private func sendOK(on connection: NWConnection) {
-        let body = #"{"id":"uitest-123"}"#
+    private func respond(on connection: NWConnection, to buffer: Data) {
+        let (method, path) = Self.requestLine(buffer)
+        onAnyRequest?(method, path)
+        if path.contains("feedback/upload-url") {
+            let key = "feedback/uploads/uitest-\(UUID().uuidString).bin"
+            let url = "http://127.0.0.1:\(port)/upload/\(key)"
+            send(json: "{\"uploadUrl\":\"\(url)\",\"key\":\"\(key)\",\"expiresIn\":600}", on: connection)
+        } else if method == "PUT" {
+            send(json: "{\"ok\":true}", on: connection)
+        } else if path.contains("feedback/report") {
+            handle(request: buffer)
+            send(json: "{\"id\":\"uitest-123\"}", on: connection)
+        } else {
+            send(json: "{\"id\":\"uitest-123\"}", on: connection)
+        }
+    }
+
+    private func send(json body: String, on connection: NWConnection) {
         let response = "HTTP/1.1 200 OK\r\n"
             + "Content-Type: application/json\r\n"
             + "Content-Length: \(body.utf8.count)\r\n"
@@ -88,7 +116,8 @@ final class MockFeedbackServer {
     private func isBodyComplete(_ buffer: Data) -> Bool {
         guard let headerRange = buffer.range(of: Data("\r\n\r\n".utf8)) else { return false }
         guard let length = headerLine(named: "content-length", in: buffer).flatMap({ Int($0) }) else {
-            return false
+            // No body (e.g. a bodiless GET) — headers alone complete the request.
+            return true
         }
         let bodyCount = buffer.distance(from: headerRange.upperBound, to: buffer.endIndex)
         return bodyCount >= length
@@ -96,26 +125,28 @@ final class MockFeedbackServer {
 
     private func handle(request buffer: Data) {
         guard let onRequestReceived = onRequestReceived else { return }
-        // Never report a non-request (e.g. an empty connection from happy-eyeballs) — doing
-        // so would clobber a good payload already surfaced to the probe.
         guard
             let headerRange = buffer.range(of: Data("\r\n\r\n".utf8)),
             let boundary = boundary(in: buffer)
         else { return }
         let body = buffer.subdata(in: headerRange.upperBound..<buffer.endIndex)
         let fields = parseFields(body: body, boundary: boundary)
-        let screenName = fields["screenName"].flatMap { String(data: $0, encoding: .utf8) }
-        let message = fields["message"].flatMap { String(data: $0, encoding: .utf8) }
-        let breadcrumbs = fields["meta"]
-            .flatMap { String(data: $0, encoding: .utf8) }
-            .map(Self.breadcrumbs(fromMeta:)) ?? []
-        onRequestReceived(
-            ReceivedRequest(screenName: screenName, breadcrumbs: breadcrumbs, message: message)
-        )
+        func str(_ key: String) -> String? { fields[key].flatMap { String(data: $0, encoding: .utf8) } }
+
+        let metaString = str("meta")
+        onRequestReceived(ReceivedRequest(
+            screenName: str("screenName"),
+            breadcrumbs: metaString.map(Self.breadcrumbs(fromMeta:)) ?? [],
+            message: str("message"),
+            type: str("type"),
+            severity: str("severity"),
+            area: str("area"),
+            email: str("email"),
+            attachmentCount: str("attachments").flatMap(Self.attachmentCount(fromJSON:)) ?? 0,
+            sessionId: metaString.flatMap(Self.sessionId(fromMeta:))
+        ))
     }
 
-    /// Split a multipart body into `name` → raw value, skipping binary parts is not needed
-    /// (callers only read the text fields). The screenshot's bytes are captured but unused.
     private func parseFields(body: Data, boundary: String) -> [String: Data] {
         var fields: [String: Data] = [:]
         let delimiter = Data("--\(boundary)".utf8)
@@ -137,7 +168,6 @@ final class MockFeedbackServer {
             guard let sep = part.range(of: headerSep) else { continue }
             let headerData = part.subdata(in: part.startIndex..<sep.lowerBound)
             var content = part.subdata(in: sep.upperBound..<part.endIndex)
-            // Strip the trailing CRLF that precedes the next boundary.
             if content.count >= 2 {
                 content = content.subdata(in: content.startIndex..<content.index(content.endIndex, offsetBy: -2))
             }
@@ -175,6 +205,16 @@ final class MockFeedbackServer {
         return String(contentType[range.upperBound...])
     }
 
+    private static func requestLine(_ buffer: Data) -> (method: String, path: String) {
+        guard
+            let lineEnd = buffer.range(of: Data("\r\n".utf8)),
+            let line = String(data: buffer.subdata(in: buffer.startIndex..<lineEnd.lowerBound), encoding: .utf8)
+        else { return ("", "") }
+        let parts = line.split(separator: " ")
+        guard parts.count >= 2 else { return ("", "") }
+        return (String(parts[0]), String(parts[1]))
+    }
+
     private static func name(inDisposition headers: String) -> String? {
         guard let range = headers.range(of: "name=\"") else { return nil }
         let rest = headers[range.upperBound...]
@@ -189,5 +229,21 @@ final class MockFeedbackServer {
             let crumbs = object["catchdev.breadcrumbs"] as? [[String: Any]]
         else { return [] }
         return crumbs.compactMap { $0["screen"] as? String }
+    }
+
+    private static func sessionId(fromMeta meta: String) -> String? {
+        guard
+            let data = meta.data(using: .utf8),
+            let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        else { return nil }
+        return object["catchdev.sessionId"] as? String
+    }
+
+    private static func attachmentCount(fromJSON json: String) -> Int? {
+        guard
+            let data = json.data(using: .utf8),
+            let array = try? JSONSerialization.jsonObject(with: data) as? [Any]
+        else { return nil }
+        return array.count
     }
 }

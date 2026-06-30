@@ -27,6 +27,10 @@ public final class CatchDev: NSObject {
     private let lock = NSLock()
     private let client: FeedbackClient
 
+    /// Uploads attachments (screenshots / recordings / files) straight to R2 via a
+    /// backend-minted presigned URL. Stateless, so one instance is shared.
+    private let uploader = AttachmentUploader()
+
     /// Durable queue for offline / background delivery. `nil` falls back to in-memory send.
     private let outbox: FeedbackOutbox?
     /// Whether to watch connectivity and auto-flush on reconnect (off in unit tests).
@@ -38,6 +42,7 @@ public final class CatchDev: NSObject {
     private var environment: String?
     private var breadcrumbs = BreadcrumbTrail(capacity: CatchDev.breadcrumbCapacity)
     private var breadcrumbsEnabled = true
+    private var networkCaptureEnabled = false
     private var shakeEnabled = true
     private var shakeInstalled = false
     private var trackerInstalled = false
@@ -79,6 +84,16 @@ public final class CatchDev: NSObject {
     @objc(startWithApiKey:endpoint:)
     public static func start(apiKey: String, endpoint: URL?) {
         shared.configure(apiKey: apiKey, endpoint: endpoint)
+    }
+
+    /// Test-only: wipe the durable on-disk outbox so UI tests start from a clean slate.
+    /// The outbox lives in Application Support and otherwise persists across app launches
+    /// in the same simulator, leaking queued reports between tests.
+    @_spi(CatchDevTesting)
+    public static func resetPersistenceForTesting() {
+        if let dir = FeedbackOutbox.defaultDirectory() {
+            try? FileManager.default.removeItem(at: dir)
+        }
     }
 
     /// Attach an end-user identity to subsequent reports.
@@ -133,6 +148,25 @@ public final class CatchDev: NSObject {
         set { withLock { $0.breadcrumbsEnabled = newValue } }
     }
 
+    /// Whether the SDK captures the host app's FAILED network calls (non-2xx responses +
+    /// transport errors) for the reporter's "Failed network calls" diagnostic. **Off by
+    /// default** — it installs a global `URLProtocol` interceptor, so enable it
+    /// deliberately. Records are redacted to method + host/path + status; see
+    /// ``CatchDevNetworkCapture`` for the best-effort coverage caveats.
+    @objc public static var isNetworkCaptureEnabled: Bool {
+        get { shared.withLock { $0.networkCaptureEnabled } }
+        set {
+            let shouldInstall = shared.withLock { state -> Bool in
+                let wasEnabled = state.networkCaptureEnabled
+                state.networkCaptureEnabled = newValue
+                return newValue && !wasEnabled
+            }
+            // The interceptor can't be uninstalled once swizzled; toggling off simply
+            // stops the snapshot from being attached at submit time.
+            if shouldInstall { CatchDevNetworkCapture.shared.install() }
+        }
+    }
+
     /// Print SDK diagnostics to the console. Off by default — useful while integrating.
     @objc public static var isDebugLoggingEnabled: Bool {
         get { shared.withLock { $0.debugLogging } }
@@ -178,13 +212,19 @@ public final class CatchDev: NSObject {
     func submit(
         message: String,
         imageData: Data?,
+        type: ReportType = .feedback,
+        severity: Severity? = nil,
+        area: String? = nil,
+        contactEmail: String? = nil,
+        attachments: [Attachment] = [],
         reportId: String? = nil,
         screenName: String? = nil,
+        excludedDiagnostics: Set<DiagnosticID> = [],
         completion: @escaping (Result<String, Error>) -> Void
     ) {
-        let (configuration, user, metadata, environment, breadcrumbs) = withLock { state in
+        let (configuration, user, metadata, environment, breadcrumbs, networkCapture) = withLock { state in
             (state.configuration, state.user, state.metadata, state.environment,
-             state.breadcrumbs.snapshot())
+             state.breadcrumbs.snapshot(), state.networkCaptureEnabled)
         }
         guard let configuration else {
             let result: Result<String, Error> = .failure(CatchDevError.notStarted)
@@ -194,14 +234,38 @@ public final class CatchDev: NSObject {
         }
         var report = FeedbackReport(message: message)
         if let reportId { report.reportId = reportId }
-        report.email = user?.email
+        report.type = type
+        report.severity = severity
+        report.area = area
+        // Contact field (when set) overrides the configured user email.
+        let trimmedContact = contactEmail?.trimmingCharacters(in: .whitespacesAndNewlines)
+        report.email = (trimmedContact?.isEmpty == false) ? trimmedContact : user?.email
         report.userId = user?.id
         report.metadata = metadata
         report.environment = environment
         report.screenName = screenName
         report.breadcrumbs = breadcrumbs
+        report.attachments = attachments
         report.imageData = imageData
         report.applyDeviceContext()
+
+        // Diagnostics the SDK contributes automatically. Session is always included
+        // (locked in the UI); the rest are dropped when the user toggled them off.
+        report.sessionId = SessionInfo.sessionId
+        if networkCapture, !excludedDiagnostics.contains(.network) {
+            report.failedRequests = CatchDevNetworkCapture.shared.snapshot()
+        }
+        if excludedDiagnostics.contains(.screen) { report.screenName = nil }
+        if excludedDiagnostics.contains(.user) { report.userId = nil }
+        if excludedDiagnostics.contains(.breadcrumbs) { report.breadcrumbs = [] }
+        if excludedDiagnostics.contains(.version) {
+            report.appVersion = nil
+            report.appBuild = nil
+        }
+        if excludedDiagnostics.contains(.device) {
+            report.device = nil
+            report.osVersion = nil
+        }
 
         // Persist before attempting the network so the report survives offline / app death.
         var queuedDurably = false
@@ -235,6 +299,32 @@ public final class CatchDev: NSObject {
                 }
             }
         }
+    }
+
+    /// Upload one attachment's bytes to R2 (via a backend-minted presigned URL) and yield
+    /// a reference for the report's `attachments`. Used by the reporter UI. Safe to call
+    /// from any thread; the completion fires on a background queue.
+    func uploadAttachment(
+        data: Data,
+        kind: AttachmentKind,
+        contentType: String,
+        filename: String?,
+        annotated: Bool,
+        completion: @escaping (Result<Attachment, Error>) -> Void
+    ) {
+        guard let configuration = withLock({ $0.configuration }) else {
+            completion(.failure(CatchDevError.notStarted))
+            return
+        }
+        uploader.upload(
+            data: data,
+            kind: kind,
+            contentType: contentType,
+            filename: filename,
+            annotated: annotated,
+            configuration: configuration,
+            completion: completion
+        )
     }
 
     /// Drain the outbox, oldest first, delivering each queued report. Delivered and
@@ -309,6 +399,12 @@ public final class CatchDev: NSObject {
             state.breadcrumbs.record(crumb)
         }
     }
+
+    /// The configured end-user id, for the reporter's "User ID" diagnostic row.
+    var currentUserId: String? { withLock { $0.user?.id } }
+
+    /// Number of breadcrumbs currently in the trail, for the diagnostics summary.
+    var breadcrumbCount: Int { withLock { $0.breadcrumbs.snapshot().count } }
 
     private func notifyFeedbackSent(_ result: Result<String, Error>) {
         guard let handler = withLock({ $0.feedbackSentHandler }) else { return }
@@ -410,11 +506,18 @@ public final class CatchDev: NSObject {
             // Capture on the main thread, immediately before presenting, so the
             // reporter UI is not part of the screenshot. Resolve the screen name from
             // the SAME presenter now — at submit-time the top VC is the reporter itself.
-            let screenName = ScreenName.resolve(presenter)
-            let reporter = ReporterViewController(
-                screenshot: ScreenshotCapturer.capture(),
-                screenName: screenName
-            )
+            // A pending restore (returning from the Record flow) reopens the same draft
+            // instead of capturing a fresh screenshot.
+            let reporter: ReporterViewController
+            if let restore = ReporterViewController.consumePendingRestore() {
+                reporter = ReporterViewController(restoring: restore)
+            } else {
+                let screenName = ScreenName.resolve(presenter)
+                reporter = ReporterViewController(
+                    screenshot: ScreenshotCapturer.capture(),
+                    screenName: screenName
+                )
+            }
             reporter.onClose = { [weak self] in
                 self?.withLock { $0.presentingReporter = false }
             }

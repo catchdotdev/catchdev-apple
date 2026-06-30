@@ -1,5 +1,5 @@
 import UIKit
-import CatchDev
+@_spi(CatchDevTesting) import CatchDev
 
 /// UIKit entry point for the example app. Starts the SDK, builds the tab/navigation UI,
 /// and — under `-CatchDevUITest` — wires the in-process mock server to a debug probe so
@@ -18,6 +18,9 @@ final class AppDelegate: UIResponder, UIApplicationDelegate {
         // Start the SDK BEFORE building the window: this installs the view-controller
         // tracker swizzle, so the very first screen's appearance is recorded.
         if isUITest {
+            // Hermetic tests: wipe any outbox left by a previous test launch so a stale
+            // queued report can't replay into this run.
+            CatchDev.resetPersistenceForTesting()
             let port = MockFeedbackServer.shared.start()
             // Use 127.0.0.1 (not "localhost"): the latter is dual-stack, and happy-eyeballs
             // can open a second loopback connection that closes empty — which would report a
@@ -38,14 +41,16 @@ final class AppDelegate: UIResponder, UIApplicationDelegate {
         if isUITest {
             let probe = DebugProbeView()
             probe.attach(to: window)
+            probe.setMockPort(MockFeedbackServer.shared.port)
             debugProbe = probe
             MockFeedbackServer.shared.onRequestReceived = { [weak probe] received in
                 DispatchQueue.main.async {
-                    probe?.update(
-                        screenName: received.screenName,
-                        breadcrumbs: received.breadcrumbs,
-                        message: received.message
-                    )
+                    probe?.update(received)
+                }
+            }
+            MockFeedbackServer.shared.onAnyRequest = { [weak probe] method, path in
+                DispatchQueue.main.async {
+                    probe?.noteRequest(method: method, path: path)
                 }
             }
         }

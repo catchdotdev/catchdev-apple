@@ -1,81 +1,81 @@
 #if canImport(UIKit)
 import UIKit
-#if canImport(PencilKit)
-import PencilKit
-#endif
+import UniformTypeIdentifiers
 
-/// Navigation container for the feedback reporter. Also a marker type so the SDK
-/// never presents the reporter on top of itself.
+/// Navigation container for the feedback reporter. Also a marker type so the SDK never
+/// presents the reporter on top of itself. The reporter draws its own top bar, so the
+/// navigation bar is hidden.
 final class ReporterContainer: UINavigationController {}
 
-/// Stable accessibility identifiers for the reporter's controls. Shared with UI tests.
-public enum CatchDevReporterAccessibility {
-    public static let message = "catchdev.reporter.message"
-    public static let send = "catchdev.reporter.send"
-    public static let cancel = "catchdev.reporter.cancel"
-    public static let undo = "catchdev.reporter.undo"
-    public static let clear = "catchdev.reporter.clear"
-    public static let screenshot = "catchdev.reporter.screenshot"
-}
-
-/// The shake-to-report feedback sheet: an (optionally annotated) screenshot plus a
-/// message field. Built in UIKit so it presents identically from UIKit, SwiftUI and
-/// Objective-C host apps.
+/// The shake-to-report sheet: report-type tabs, a description, optional severity/area,
+/// multiple attachments (screenshot/recording/file) with annotation, an auto-attached
+/// diagnostics disclosure, and a sticky Send. Built in UIKit so it presents identically
+/// from UIKit, SwiftUI and Objective-C hosts.
 final class ReporterViewController: UIViewController {
+    /// State preserved across the Record flow's dismiss → record → re-present round-trip.
+    /// Consumed by ``CatchDev/presentReporter()`` so a recording resumes the same draft.
+    static var pendingRestore: ReporterRestoreState?
 
-    private let screenshot: UIImage?
+    static func consumePendingRestore() -> ReporterRestoreState? {
+        defer { pendingRestore = nil }
+        return pendingRestore
+    }
 
-    /// Name of the screen the reporter was opened on, captured at present-time and sent
-    /// as the report's `screenName`.
+    private let originalScreenshot: UIImage?
     private let screenName: String?
+    private let restoreState: ReporterRestoreState?
+    private var reportId: String
 
-    /// One idempotency key per reporter session: a manual "try again" after a failed
-    /// send replays the SAME key, so a stored-but-unacknowledged first attempt is
-    /// deduped server-side instead of creating a duplicate row.
-    private let reportId = UUID().uuidString.lowercased()
-
-    /// Called when the reporter is dismissed, so the SDK can clear its present latch.
     var onClose: (() -> Void)?
-
-    /// onClose must fire exactly once, even when UIKit rejects the presentation and
-    /// the controller deallocates without ever appearing (see `deinit` backstop) —
-    /// otherwise the latch sticks and shake-to-report dies for the session.
     private var closeNotified = false
 
+    // Form state
+    private var reportType: ReportType = .feedback
+    private var drafts: [String: String] = [:]
+    private var severity: Severity?
+    private var area: String?
+    private var attachments: [PendingAttachment] = []
+    private var excluded: Set<DiagnosticID> = []
+
+    // Views
     private let scrollView = UIScrollView()
     private let contentStack = UIStackView()
-    private let imageContainer = UIView()
-    private let imageView = UIImageView()
-    private let messageTextView = UITextView()
+    private let tabsView = SegmentedTabsView()
+    private let descriptionTextView = UITextView()
     private let placeholderLabel = UILabel()
-    private let activityIndicator = UIActivityIndicatorView(style: .medium)
-    private lazy var sendButton = UIBarButtonItem(
-        title: "Send",
-        style: .done,
-        target: self,
-        action: #selector(sendTapped)
-    )
+    private let titlePreviewLabel = UILabel()
+    private let severityView = SeverityView()
+    private var severitySection: UIView!
+    private let areaDropdown = AreaDropdownView()
+    private let attachmentsView = AttachmentsView()
+    private let contactField = UITextField()
+    private let diagnosticsView = DiagnosticsView()
+    private let footerView = UIView()
+    private let sendButton = UIButton(type: .system)
 
-    #if canImport(PencilKit)
-    private let canvasView = PKCanvasView()
-    #endif
+    private var sendingOverlay: UIView?
 
     init(screenshot: UIImage?, screenName: String? = nil) {
-        self.screenshot = screenshot
+        self.originalScreenshot = screenshot
         self.screenName = screenName
+        self.restoreState = nil
+        self.reportId = UUID().uuidString.lowercased()
+        super.init(nibName: nil, bundle: nil)
+    }
+
+    init(restoring state: ReporterRestoreState) {
+        self.originalScreenshot = state.attachments.first(where: { $0.kind == .screenshot })?.thumbnail
+        self.screenName = state.screenName
+        self.restoreState = state
+        self.reportId = state.reportId
         super.init(nibName: nil, bundle: nil)
     }
 
     @available(*, unavailable)
-    required init?(coder: NSCoder) {
-        fatalError("init(coder:) is not supported")
-    }
+    required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
 
     deinit {
         NotificationCenter.default.removeObserver(self)
-        // Backstop: if the presentation was rejected by UIKit (presenter mid-dismissal,
-        // view not in a window, scene disconnect), viewDidDisappear never fires with a
-        // dismissal flag — the dealloc is then the only signal that the latch must clear.
         notifyClose()
     }
 
@@ -85,25 +85,27 @@ final class ReporterViewController: UIViewController {
         onClose?()
     }
 
+    // MARK: - Lifecycle
+
     override func viewDidLoad() {
         super.viewDidLoad()
-        view.backgroundColor = .systemBackground
-        title = "Send feedback"
+        navigationController?.setNavigationBarHidden(true, animated: false)
+        view.backgroundColor = ReporterTheme.bg
 
-        let cancelButton = UIBarButtonItem(
-            barButtonSystemItem: .cancel,
-            target: self,
-            action: #selector(cancelTapped)
-        )
-        cancelButton.accessibilityIdentifier = CatchDevReporterAccessibility.cancel
-        navigationItem.leftBarButtonItem = cancelButton
-
-        sendButton.accessibilityIdentifier = CatchDevReporterAccessibility.send
-        navigationItem.rightBarButtonItem = sendButton
-
-        configureLayout()
-        configureAnnotation()
+        buildTopBar()
+        buildTabs()
+        buildBody()
+        buildFooter()
         observeKeyboard()
+
+        if let restoreState {
+            apply(restoreState)
+        } else if let screenshot = originalScreenshot {
+            seedScreenshot(screenshot)
+        }
+        refreshForTab(animated: false)
+        refreshDiagnostics()
+        refreshAttachments()
     }
 
     override func viewDidDisappear(_ animated: Bool) {
@@ -113,272 +115,469 @@ final class ReporterViewController: UIViewController {
         }
     }
 
-    // MARK: - Layout
+    // MARK: - Build UI
 
-    private func configureLayout() {
+    private func buildTopBar() {
+        let title = UILabel()
+        title.text = "Send report"
+        title.font = .systemFont(ofSize: 17, weight: .semibold)
+        title.textColor = ReporterTheme.text
+
+        let close = UIButton(type: .system)
+        close.setImage(ReporterStyle.symbolImage("xmark", pointSize: 16, weight: .medium), for: .normal)
+        close.tintColor = ReporterTheme.textSoft
+        close.accessibilityIdentifier = CatchDevReporterAccessibility.close
+        close.accessibilityLabel = "Close"
+        close.addAction(UIAction { [weak self] _ in self?.dismiss(animated: true) }, for: .touchUpInside)
+
+        let bar = UIStackView(arrangedSubviews: [title, close])
+        bar.axis = .horizontal
+        bar.alignment = .center
+        bar.translatesAutoresizingMaskIntoConstraints = false
+        view.addSubview(bar)
+        NSLayoutConstraint.activate([
+            bar.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 12),
+            bar.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 16),
+            bar.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -16),
+        ])
+        topBar = bar
+    }
+    private var topBar: UIStackView!
+
+    private func buildTabs() {
+        tabsView.translatesAutoresizingMaskIntoConstraints = false
+        tabsView.onChange = { [weak self] type in self?.switchTab(to: type) }
+        view.addSubview(tabsView)
+        NSLayoutConstraint.activate([
+            tabsView.topAnchor.constraint(equalTo: topBar.bottomAnchor, constant: 12),
+            tabsView.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 16),
+            tabsView.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -16),
+        ])
+    }
+
+    private func buildBody() {
         scrollView.translatesAutoresizingMaskIntoConstraints = false
         scrollView.keyboardDismissMode = .interactive
+        scrollView.showsVerticalScrollIndicator = false
         view.addSubview(scrollView)
-        NSLayoutConstraint.activate([
-            scrollView.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor),
-            scrollView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
-            scrollView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
-            scrollView.bottomAnchor.constraint(equalTo: view.bottomAnchor),
-        ])
 
         contentStack.axis = .vertical
-        contentStack.spacing = 12
-        contentStack.isLayoutMarginsRelativeArrangement = true
-        contentStack.layoutMargins = UIEdgeInsets(top: 16, left: 16, bottom: 16, right: 16)
+        contentStack.spacing = 18
         contentStack.translatesAutoresizingMaskIntoConstraints = false
+        contentStack.isLayoutMarginsRelativeArrangement = true
+        contentStack.layoutMargins = UIEdgeInsets(top: 8, left: 16, bottom: 16, right: 16)
         scrollView.addSubview(contentStack)
+
         NSLayoutConstraint.activate([
+            scrollView.topAnchor.constraint(equalTo: tabsView.bottomAnchor, constant: 8),
+            scrollView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            scrollView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
             contentStack.topAnchor.constraint(equalTo: scrollView.contentLayoutGuide.topAnchor),
+            contentStack.bottomAnchor.constraint(equalTo: scrollView.contentLayoutGuide.bottomAnchor),
             contentStack.leadingAnchor.constraint(equalTo: scrollView.contentLayoutGuide.leadingAnchor),
             contentStack.trailingAnchor.constraint(equalTo: scrollView.contentLayoutGuide.trailingAnchor),
-            contentStack.bottomAnchor.constraint(equalTo: scrollView.contentLayoutGuide.bottomAnchor),
             contentStack.widthAnchor.constraint(equalTo: scrollView.frameLayoutGuide.widthAnchor),
         ])
 
-        if let screenshot = screenshot {
-            imageView.image = screenshot
-            imageView.contentMode = .scaleAspectFit
-            imageView.translatesAutoresizingMaskIntoConstraints = false
-            imageView.isAccessibilityElement = true
-            imageView.accessibilityIdentifier = CatchDevReporterAccessibility.screenshot
-            imageView.accessibilityLabel = "Screenshot"
+        contentStack.addArrangedSubview(makeDescriptionSection())
+        severitySection = makeSeveritySection()
+        contentStack.addArrangedSubview(severitySection)
+        contentStack.addArrangedSubview(makeAreaSection())
+        contentStack.addArrangedSubview(makeAttachmentsSection())
+        contentStack.addArrangedSubview(makeContactSection())
+        contentStack.addArrangedSubview(diagnosticsView)
 
-            imageContainer.translatesAutoresizingMaskIntoConstraints = false
-            imageContainer.layer.cornerRadius = 8
-            imageContainer.layer.borderWidth = 1
-            imageContainer.layer.borderColor = UIColor.separator.cgColor
-            imageContainer.clipsToBounds = true
-            imageContainer.addSubview(imageView)
-            NSLayoutConstraint.activate([
-                imageView.topAnchor.constraint(equalTo: imageContainer.topAnchor),
-                imageView.bottomAnchor.constraint(equalTo: imageContainer.bottomAnchor),
-                imageView.leadingAnchor.constraint(equalTo: imageContainer.leadingAnchor),
-                imageView.trailingAnchor.constraint(equalTo: imageContainer.trailingAnchor),
-            ])
+        diagnosticsView.onChange = { [weak self] excluded in self?.excluded = excluded }
+    }
 
-            // Keep the screenshot's aspect ratio, cap the height so a tall phone
-            // screenshot doesn't dominate the sheet, and make the container HUG the
-            // image (centered in a wrapper) — if it stretched full-width, the canvas
-            // would accept ink in letterbox gutters that the flattened upload crops.
-            let ratio = screenshot.size.height / max(screenshot.size.width, 1)
-            let wrapper = UIView()
-            wrapper.translatesAutoresizingMaskIntoConstraints = false
-            wrapper.addSubview(imageContainer)
+    private func makeDescriptionSection() -> UIView {
+        let box = UIView()
+        box.backgroundColor = ReporterTheme.fieldBg
+        box.layer.cornerRadius = 13
+        box.layer.borderWidth = 1
+        box.layer.borderColor = ReporterTheme.border.cgColor
 
-            let fullWidth = imageContainer.widthAnchor
-                .constraint(equalTo: wrapper.widthAnchor)
-            fullWidth.priority = .defaultHigh
-            NSLayoutConstraint.activate([
-                imageContainer.topAnchor.constraint(equalTo: wrapper.topAnchor),
-                imageContainer.bottomAnchor.constraint(equalTo: wrapper.bottomAnchor),
-                imageContainer.centerXAnchor.constraint(equalTo: wrapper.centerXAnchor),
-                imageContainer.widthAnchor.constraint(lessThanOrEqualTo: wrapper.widthAnchor),
-                imageContainer.heightAnchor.constraint(
-                    equalTo: imageContainer.widthAnchor, multiplier: ratio
-                ),
-                imageContainer.heightAnchor.constraint(lessThanOrEqualToConstant: 360),
-                fullWidth,
-            ])
+        descriptionTextView.backgroundColor = .clear
+        descriptionTextView.font = .systemFont(ofSize: 16)
+        descriptionTextView.textColor = ReporterTheme.text
+        descriptionTextView.delegate = self
+        descriptionTextView.translatesAutoresizingMaskIntoConstraints = false
+        descriptionTextView.textContainerInset = UIEdgeInsets(top: 14, left: 10, bottom: 14, right: 10)
+        descriptionTextView.accessibilityIdentifier = CatchDevReporterAccessibility.message
+        descriptionTextView.accessibilityLabel = "Description"
+        box.addSubview(descriptionTextView)
 
-            contentStack.addArrangedSubview(wrapper)
-            contentStack.addArrangedSubview(
-                makeHintLabel("Draw on the screenshot to highlight the problem.")
-            )
-        }
-
-        messageTextView.font = .preferredFont(forTextStyle: .body)
-        messageTextView.layer.cornerRadius = 8
-        messageTextView.layer.borderWidth = 1
-        messageTextView.layer.borderColor = UIColor.separator.cgColor
-        messageTextView.translatesAutoresizingMaskIntoConstraints = false
-        messageTextView.delegate = self
-        messageTextView.accessibilityIdentifier = CatchDevReporterAccessibility.message
-        messageTextView.accessibilityLabel = "Feedback message"
-        messageTextView.heightAnchor.constraint(greaterThanOrEqualToConstant: 120).isActive = true
-        contentStack.addArrangedSubview(messageTextView)
-
-        placeholderLabel.text = "Tell us what happened…"
-        placeholderLabel.font = .preferredFont(forTextStyle: .body)
-        placeholderLabel.textColor = .placeholderText
+        placeholderLabel.font = .systemFont(ofSize: 16)
+        placeholderLabel.textColor = ReporterTheme.textFaint
         placeholderLabel.translatesAutoresizingMaskIntoConstraints = false
-        messageTextView.addSubview(placeholderLabel)
+        box.addSubview(placeholderLabel)
+
+        box.translatesAutoresizingMaskIntoConstraints = false
         NSLayoutConstraint.activate([
-            placeholderLabel.topAnchor.constraint(equalTo: messageTextView.topAnchor, constant: 8),
-            placeholderLabel.leadingAnchor.constraint(equalTo: messageTextView.leadingAnchor, constant: 5),
+            descriptionTextView.topAnchor.constraint(equalTo: box.topAnchor),
+            descriptionTextView.bottomAnchor.constraint(equalTo: box.bottomAnchor),
+            descriptionTextView.leadingAnchor.constraint(equalTo: box.leadingAnchor),
+            descriptionTextView.trailingAnchor.constraint(equalTo: box.trailingAnchor),
+            descriptionTextView.heightAnchor.constraint(greaterThanOrEqualToConstant: 120),
+            placeholderLabel.topAnchor.constraint(equalTo: box.topAnchor, constant: 16),
+            placeholderLabel.leadingAnchor.constraint(equalTo: box.leadingAnchor, constant: 15),
+        ])
+
+        titlePreviewLabel.font = .systemFont(ofSize: 12)
+        titlePreviewLabel.textColor = ReporterTheme.textMuted
+        titlePreviewLabel.accessibilityIdentifier = CatchDevReporterAccessibility.titlePreview
+        titlePreviewLabel.isHidden = true
+
+        let column = UIStackView(arrangedSubviews: [box, titlePreviewLabel])
+        column.axis = .vertical
+        column.spacing = 8
+        return column
+    }
+
+    private func makeSeveritySection() -> UIView {
+        severityView.onChange = { [weak self] value in self?.severity = value }
+        let column = UIStackView(arrangedSubviews: [
+            ReporterStyle.sectionLabel("How bad is this?", optional: true),
+            severityView,
+        ])
+        column.axis = .vertical
+        column.spacing = 9
+        return column
+    }
+
+    private func makeAreaSection() -> UIView {
+        areaDropdown.onChange = { [weak self] value in self?.area = value }
+        let column = UIStackView(arrangedSubviews: [
+            ReporterStyle.sectionLabel("Area", optional: true),
+            areaDropdown,
+        ])
+        column.axis = .vertical
+        column.spacing = 9
+        return column
+    }
+
+    private func makeAttachmentsSection() -> UIView {
+        attachmentsView.onScreenshot = { [weak self] in self?.annotatePrimaryScreenshot() }
+        attachmentsView.onRecord = { [weak self] in self?.startRecording() }
+        attachmentsView.onAttach = { [weak self] in self?.pickFile() }
+        attachmentsView.onRemove = { [weak self] id in self?.removeAttachment(id) }
+        attachmentsView.onAnnotate = { [weak self] id in self?.annotateAttachment(id) }
+        let column = UIStackView(arrangedSubviews: [
+            ReporterStyle.sectionLabel("Add more", optional: true),
+            attachmentsView,
+        ])
+        column.axis = .vertical
+        column.spacing = 9
+        return column
+    }
+
+    private func makeContactSection() -> UIView {
+        contactField.placeholder = "you@email.com"
+        contactField.font = .systemFont(ofSize: 15)
+        contactField.textColor = ReporterTheme.text
+        contactField.backgroundColor = ReporterTheme.fieldBg
+        contactField.layer.cornerRadius = 12
+        contactField.layer.borderWidth = 1
+        contactField.layer.borderColor = ReporterTheme.border.cgColor
+        contactField.keyboardType = .emailAddress
+        contactField.autocapitalizationType = .none
+        contactField.autocorrectionType = .no
+        contactField.accessibilityIdentifier = CatchDevReporterAccessibility.contact
+        contactField.translatesAutoresizingMaskIntoConstraints = false
+        contactField.heightAnchor.constraint(equalToConstant: 48).isActive = true
+        let inset = UIView(frame: CGRect(x: 0, y: 0, width: 14, height: 1))
+        contactField.leftView = inset
+        contactField.leftViewMode = .always
+
+        let column = UIStackView(arrangedSubviews: [
+            ReporterStyle.sectionLabel("Contact email", optional: true),
+            contactField,
+        ])
+        column.axis = .vertical
+        column.spacing = 9
+        return column
+    }
+
+    private func buildFooter() {
+        footerView.backgroundColor = ReporterTheme.bg
+        footerView.translatesAutoresizingMaskIntoConstraints = false
+        let separator = UIView()
+        separator.backgroundColor = ReporterTheme.borderSoft
+        separator.translatesAutoresizingMaskIntoConstraints = false
+
+        var config = UIButton.Configuration.filled()
+        config.title = "Send report"
+        config.image = ReporterStyle.symbolImage("paperplane.fill", pointSize: 15)
+        config.imagePadding = 9
+        config.baseBackgroundColor = ReporterTheme.actionBg
+        config.baseForegroundColor = ReporterTheme.actionFg
+        config.cornerStyle = .large
+        config.titleTextAttributesTransformer = .init { incoming in
+            var out = incoming
+            out.font = .systemFont(ofSize: 15.5, weight: .semibold)
+            return out
+        }
+        sendButton.configuration = config
+        sendButton.accessibilityIdentifier = CatchDevReporterAccessibility.send
+        sendButton.translatesAutoresizingMaskIntoConstraints = false
+        sendButton.addAction(UIAction { [weak self] _ in self?.send() }, for: .touchUpInside)
+
+        view.addSubview(footerView)
+        footerView.addSubview(separator)
+        footerView.addSubview(sendButton)
+        NSLayoutConstraint.activate([
+            footerView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            footerView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            footerView.bottomAnchor.constraint(equalTo: view.bottomAnchor),
+            footerView.topAnchor.constraint(equalTo: scrollView.bottomAnchor),
+            separator.topAnchor.constraint(equalTo: footerView.topAnchor),
+            separator.leadingAnchor.constraint(equalTo: footerView.leadingAnchor),
+            separator.trailingAnchor.constraint(equalTo: footerView.trailingAnchor),
+            separator.heightAnchor.constraint(equalToConstant: 1),
+            sendButton.topAnchor.constraint(equalTo: footerView.topAnchor, constant: 12),
+            sendButton.leadingAnchor.constraint(equalTo: footerView.leadingAnchor, constant: 16),
+            sendButton.trailingAnchor.constraint(equalTo: footerView.trailingAnchor, constant: -16),
+            sendButton.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor, constant: -10),
+            sendButton.heightAnchor.constraint(equalToConstant: 52),
         ])
     }
 
-    private func makeHintLabel(_ text: String) -> UILabel {
-        let label = UILabel()
-        label.text = text
-        label.font = .preferredFont(forTextStyle: .footnote)
-        label.textColor = .secondaryLabel
-        label.numberOfLines = 0
-        return label
+    // MARK: - State sync
+
+    private var currentDraft: String {
+        get { drafts[reportType.rawValue] ?? "" }
+        set { drafts[reportType.rawValue] = newValue }
     }
 
-    private func configureAnnotation() {
-        guard screenshot != nil else { return }
-        #if canImport(PencilKit)
-        canvasView.translatesAutoresizingMaskIntoConstraints = false
-        canvasView.backgroundColor = .clear
-        canvasView.isOpaque = false
-        canvasView.drawingPolicy = .anyInput
-        canvasView.tool = PKInkingTool(.pen, color: .systemRed, width: 6)
-        imageContainer.addSubview(canvasView)
-        NSLayoutConstraint.activate([
-            canvasView.topAnchor.constraint(equalTo: imageContainer.topAnchor),
-            canvasView.bottomAnchor.constraint(equalTo: imageContainer.bottomAnchor),
-            canvasView.leadingAnchor.constraint(equalTo: imageContainer.leadingAnchor),
-            canvasView.trailingAnchor.constraint(equalTo: imageContainer.trailingAnchor),
-        ])
-
-        let undo = UIBarButtonItem(
-            image: UIImage(systemName: "arrow.uturn.backward"),
-            style: .plain,
-            target: self,
-            action: #selector(undoTapped)
-        )
-        let clear = UIBarButtonItem(
-            image: UIImage(systemName: "trash"),
-            style: .plain,
-            target: self,
-            action: #selector(clearTapped)
-        )
-        undo.accessibilityIdentifier = CatchDevReporterAccessibility.undo
-        undo.accessibilityLabel = "Undo"
-        clear.accessibilityIdentifier = CatchDevReporterAccessibility.clear
-        clear.accessibilityLabel = "Clear drawing"
-        navigationItem.rightBarButtonItems = [sendButton, clear, undo]
-        #endif
+    private func switchTab(to type: ReportType) {
+        currentDraft = descriptionTextView.text ?? ""
+        reportType = type
+        refreshForTab(animated: true)
     }
 
-    // MARK: - Actions
-
-    @objc private func cancelTapped() {
-        dismiss(animated: true)
+    private func refreshForTab(animated: Bool) {
+        descriptionTextView.text = currentDraft
+        placeholderLabel.text = reportType == .bug
+            ? "What happened? What did you expect?"
+            : "What would make this better?"
+        placeholderLabel.isHidden = !currentDraft.isEmpty
+        updateTitlePreview()
+        tabsView.setSelected(reportType, animated: animated)
+        let show = reportType == .bug
+        UIView.animate(withDuration: animated ? 0.2 : 0) {
+            self.severitySection.isHidden = !show
+        }
     }
 
-    #if canImport(PencilKit)
-    @objc private func undoTapped() {
-        canvasView.undoManager?.undo()
+    private func updateTitlePreview() {
+        let title = Self.deriveTitle(descriptionTextView.text ?? "")
+        if let title {
+            titlePreviewLabel.text = "TITLE  “\(title)” · auto"
+            titlePreviewLabel.isHidden = false
+        } else {
+            titlePreviewLabel.isHidden = true
+        }
     }
 
-    @objc private func clearTapped() {
-        canvasView.drawing = PKDrawing()
+    static func deriveTitle(_ text: String) -> String? {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+            .replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
+        guard trimmed.count >= 6 else { return nil }
+        let words = trimmed.split(separator: " ")
+        let head = words.prefix(7).joined(separator: " ")
+        let capitalized = head.prefix(1).uppercased() + head.dropFirst()
+        return capitalized + (words.count > 7 ? "…" : "")
     }
-    #endif
 
-    @objc private func sendTapped() {
-        let message = (messageTextView.text ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+    private func refreshAttachments() {
+        attachmentsView.setAttachments(attachments)
+    }
+
+    private func refreshDiagnostics() {
+        diagnosticsView.configure(items: buildDiagnosticItems())
+    }
+
+    // MARK: - Attachments
+
+    private func seedScreenshot(_ image: UIImage) {
+        guard let data = image.jpegData(compressionQuality: 0.8) else { return }
+        attachments.append(PendingAttachment(
+            kind: .screenshot, data: data, contentType: "image/jpeg",
+            filename: "screenshot.jpg", annotated: false, thumbnail: image
+        ))
+    }
+
+    private func annotatePrimaryScreenshot() {
+        if let index = attachments.firstIndex(where: { $0.kind == .screenshot }) {
+            annotate(at: index)
+        } else if let original = originalScreenshot {
+            seedScreenshot(original)
+            refreshAttachments()
+            if let index = attachments.firstIndex(where: { $0.kind == .screenshot }) { annotate(at: index) }
+        }
+    }
+
+    private func annotateAttachment(_ id: String) {
+        guard let index = attachments.firstIndex(where: { $0.id == id }),
+              attachments[index].kind == .screenshot else { return }
+        annotate(at: index)
+    }
+
+    private func annotate(at index: Int) {
+        let image = attachments[index].thumbnail ?? UIImage()
+        let annotator = AnnotateViewController(image: image, onDone: { [weak self] flattened in
+            guard let self else { return }
+            self.dismiss(animated: true)
+            if let data = flattened.jpegData(compressionQuality: 0.8) {
+                self.attachments[index].data = data
+                self.attachments[index].thumbnail = flattened
+                self.attachments[index].annotated = true
+                self.refreshAttachments()
+            }
+        }, onCancel: { [weak self] in self?.dismiss(animated: true) })
+        present(annotator, animated: true)
+    }
+
+    private func removeAttachment(_ id: String) {
+        attachments.removeAll { $0.id == id }
+        refreshAttachments()
+    }
+
+    private func pickFile() {
+        let picker = UIDocumentPickerViewController(forOpeningContentTypes: [.item])
+        picker.delegate = self
+        picker.allowsMultipleSelection = false
+        present(picker, animated: true)
+    }
+
+    // MARK: - Diagnostics list
+
+    private func buildDiagnosticItems() -> [DiagnosticItem] {
+        var items: [DiagnosticItem] = []
+        if let screenName, !screenName.isEmpty {
+            items.append(.init(id: .screen, icon: "rectangle.on.rectangle", title: "Current screen", value: screenName, locked: false))
+        }
+        let version = [DeviceContext.appVersion, DeviceContext.appBuild.map { "(\($0))" }]
+            .compactMap { $0 }.joined(separator: " ")
+        if !version.isEmpty {
+            items.append(.init(id: .version, icon: "tag", title: "App version", value: version, locked: false))
+        }
+        let device = "\(DeviceContext.deviceModel) · \(DeviceContext.osVersion)"
+        items.append(.init(id: .device, icon: "iphone", title: "Device & OS", value: device, locked: false))
+        if let userId = CatchDev.shared.currentUserId, !userId.isEmpty {
+            items.append(.init(id: .user, icon: "person", title: "User ID", value: userId, locked: false))
+        }
+        let crumbs = CatchDev.shared.breadcrumbCount
+        if crumbs > 0 {
+            items.append(.init(id: .breadcrumbs, icon: "hand.tap", title: "Recent screens", value: "\(crumbs) breadcrumbs", locked: false))
+        }
+        if CatchDev.isNetworkCaptureEnabled {
+            let failed = CatchDevNetworkCapture.shared.snapshot().count
+            items.append(.init(id: .network, icon: "wifi.slash", title: "Failed network calls", value: "\(failed)", locked: false))
+        }
+        items.append(.init(id: .session, icon: "touchid", title: "Session ID", value: SessionInfo.sessionId, locked: true))
+        return items
+    }
+
+    // MARK: - Send
+
+    private func send() {
+        let message = (descriptionTextView.text ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
         guard !message.isEmpty else {
-            shake(messageTextView)
-            messageTextView.becomeFirstResponder()
+            shake(descriptionTextView)
+            descriptionTextView.becomeFirstResponder()
             return
         }
         view.endEditing(true)
-        setLoading(true)
+        let contact = contactField.text
+        let pending = attachments
 
-        let imageData = composedImage()?.jpegData(compressionQuality: 0.8)
-        CatchDev.shared.submit(
-            message: message,
-            imageData: imageData,
-            reportId: reportId,
-            screenName: screenName
-        ) { [weak self] result in
-            DispatchQueue.main.async {
-                guard let self = self else { return }
-                self.setLoading(false)
-                switch result {
-                case .success:
-                    self.dismiss(animated: true)
-                case .failure(let error):
-                    self.presentSendError(error)
+        let overlay = SendingOverlayView(steps: [
+            "Bundling breadcrumbs", "Attaching context", "Uploading attachments", "Posting to Catch",
+        ])
+        showOverlay(overlay)
+
+        uploadAll(pending, uploaded: []) { [weak self] result in
+            guard let self else { return }
+            switch result {
+            case .failure(let error):
+                DispatchQueue.main.async {
+                    self.hideOverlay()
+                    self.presentError(error)
+                }
+            case .success(let uploaded):
+                CatchDev.shared.submit(
+                    message: message,
+                    imageData: nil,
+                    type: self.reportType,
+                    severity: self.reportType == .bug ? self.severity : nil,
+                    area: self.area,
+                    contactEmail: contact,
+                    attachments: uploaded,
+                    reportId: self.reportId,
+                    screenName: self.screenName,
+                    excludedDiagnostics: self.excluded
+                ) { submitResult in
+                    DispatchQueue.main.async {
+                        switch submitResult {
+                        case .success(let id):
+                            self.showSuccess(reportId: id.isEmpty ? self.reportId : id)
+                        case .failure(let error):
+                            self.hideOverlay()
+                            self.presentError(error)
+                        }
+                    }
                 }
             }
         }
     }
 
-    // MARK: - Helpers
-
-    /// Flatten the screenshot and any annotation into a single image at the
-    /// screenshot's NATIVE resolution. Annotation strokes live in the canvas's
-    /// on-screen coordinates (an aspect-fit display of the image), so they are
-    /// rasterized with PencilKit's CPU renderer — reliable, unlike a drawHierarchy
-    /// snapshot of the Metal-backed canvas — and mapped onto the full-size image.
-    /// Snapshotting the preview container instead would upload a ~360pt letterboxed
-    /// thumbnail with black bars.
-    private func composedImage() -> UIImage? {
-        guard let screenshot = screenshot else { return nil }
-
-        #if canImport(PencilKit)
-        let drawing = canvasView.drawing
-        guard !drawing.strokes.isEmpty else { return screenshot }
-
-        let displayed = displayedImageRect()
-        guard displayed.width > 0, displayed.height > 0 else { return screenshot }
-
-        // Rasterize the strokes from the displayed rect at native pixel density.
-        let pixelScale = (screenshot.size.width * screenshot.scale) / displayed.width
-        let annotation = drawing.image(from: displayed, scale: pixelScale)
-
-        let format = UIGraphicsImageRendererFormat()
-        format.scale = screenshot.scale
-        format.opaque = true
-        let renderer = UIGraphicsImageRenderer(size: screenshot.size, format: format)
-        return renderer.image { _ in
-            let full = CGRect(origin: .zero, size: screenshot.size)
-            screenshot.draw(in: full)
-            annotation.draw(in: full)
-        }
-        #else
-        return screenshot
-        #endif
-    }
-
-    /// The aspect-fit rect the screenshot occupies inside the image view (and the
-    /// canvas, which shares its bounds) — the coordinate space annotations are drawn in.
-    private func displayedImageRect() -> CGRect {
-        guard let screenshot = screenshot else { return .zero }
-        let bounds = imageView.bounds
-        guard bounds.width > 0, bounds.height > 0,
-              screenshot.size.width > 0, screenshot.size.height > 0
-        else { return .zero }
-        let fit = min(
-            bounds.width / screenshot.size.width,
-            bounds.height / screenshot.size.height
-        )
-        let size = CGSize(
-            width: screenshot.size.width * fit,
-            height: screenshot.size.height * fit
-        )
-        return CGRect(
-            x: bounds.midX - size.width / 2,
-            y: bounds.midY - size.height / 2,
-            width: size.width,
-            height: size.height
-        )
-    }
-
-    private func setLoading(_ loading: Bool) {
-        sendButton.isEnabled = !loading
-        navigationItem.leftBarButtonItem?.isEnabled = !loading
-        messageTextView.isEditable = !loading
-        if loading {
-            activityIndicator.startAnimating()
-            navigationItem.titleView = activityIndicator
-        } else {
-            activityIndicator.stopAnimating()
-            navigationItem.titleView = nil
+    /// Upload pending attachments one at a time, collecting their references.
+    private func uploadAll(
+        _ remaining: [PendingAttachment],
+        uploaded: [Attachment],
+        completion: @escaping (Result<[Attachment], Error>) -> Void
+    ) {
+        guard let next = remaining.first else { completion(.success(uploaded)); return }
+        CatchDev.shared.uploadAttachment(
+            data: next.data, kind: next.kind, contentType: next.contentType,
+            filename: next.filename, annotated: next.annotated
+        ) { [weak self] result in
+            guard let self else { return }
+            switch result {
+            case .failure(let error):
+                completion(.failure(error))
+            case .success(let attachment):
+                self.uploadAll(Array(remaining.dropFirst()), uploaded: uploaded + [attachment], completion: completion)
+            }
         }
     }
 
-    private func presentSendError(_ error: Error) {
+    private func showSuccess(reportId: String) {
+        let success = SuccessOverlayView(type: reportType, reportId: reportId)
+        success.onDone = { [weak self] in self?.dismiss(animated: true) }
+        showOverlay(success)
+    }
+
+    private func showOverlay(_ overlay: UIView) {
+        sendingOverlay?.removeFromSuperview()
+        overlay.translatesAutoresizingMaskIntoConstraints = false
+        view.addSubview(overlay)
+        NSLayoutConstraint.activate([
+            overlay.topAnchor.constraint(equalTo: view.topAnchor),
+            overlay.bottomAnchor.constraint(equalTo: view.bottomAnchor),
+            overlay.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            overlay.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+        ])
+        sendingOverlay = overlay
+    }
+
+    private func hideOverlay() {
+        sendingOverlay?.removeFromSuperview()
+        sendingOverlay = nil
+    }
+
+    private func presentError(_ error: Error) {
         let message: String
         switch error {
         case CatchDevError.transport:
@@ -388,13 +587,72 @@ final class ReporterViewController: UIViewController {
         default:
             message = "Something went wrong. Please try again."
         }
-        let alert = UIAlertController(
-            title: "Couldn’t send feedback",
-            message: message,
-            preferredStyle: .alert
-        )
+        let alert = UIAlertController(title: "Couldn’t send report", message: message, preferredStyle: .alert)
         alert.addAction(UIAlertAction(title: "OK", style: .default))
         present(alert, animated: true)
+    }
+
+    // MARK: - Record
+
+    private func startRecording() {
+        guard ReporterRecordingSession.shared.isAvailable else {
+            let alert = UIAlertController(
+                title: "Recording unavailable",
+                message: "Screen recording isn’t available on this device.",
+                preferredStyle: .alert
+            )
+            alert.addAction(UIAlertAction(title: "OK", style: .default))
+            present(alert, animated: true)
+            return
+        }
+        currentDraft = descriptionTextView.text ?? ""
+        ReporterViewController.pendingRestore = ReporterRestoreState(
+            drafts: drafts, tab: reportType, severity: severity, area: area,
+            contact: contactField.text ?? "", excluded: excluded,
+            attachments: attachments, screenName: screenName, reportId: reportId
+        )
+        // The reporter deallocates once dismissed, so the recording flow is owned by a
+        // singleton that survives. The completion intentionally does not capture `self`.
+        dismiss(animated: true) {
+            ReporterRecordingSession.shared.begin()
+        }
+    }
+
+    private func apply(_ state: ReporterRestoreState) {
+        drafts = state.drafts
+        reportType = state.tab
+        severity = state.severity
+        area = state.area
+        attachments = state.attachments
+        excluded = state.excluded
+        contactField.text = state.contact
+        severityView.setSelected(state.severity)
+        areaDropdown.setSelected(state.area)
+    }
+
+    // MARK: - Keyboard
+
+    private func observeKeyboard() {
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(keyboardWillChange(_:)),
+            name: UIResponder.keyboardWillChangeFrameNotification, object: nil
+        )
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(keyboardWillHide),
+            name: UIResponder.keyboardWillHideNotification, object: nil
+        )
+    }
+
+    @objc private func keyboardWillChange(_ note: Notification) {
+        guard let frame = note.userInfo?[UIResponder.keyboardFrameEndUserInfoKey] as? CGRect else { return }
+        let overlap = view.bounds.maxY - view.convert(frame, from: nil).minY
+        scrollView.contentInset.bottom = max(0, overlap - footerView.bounds.height)
+        scrollView.verticalScrollIndicatorInsets.bottom = max(0, overlap)
+    }
+
+    @objc private func keyboardWillHide() {
+        scrollView.contentInset.bottom = 0
+        scrollView.verticalScrollIndicatorInsets.bottom = 0
     }
 
     private func shake(_ target: UIView) {
@@ -403,42 +661,27 @@ final class ReporterViewController: UIViewController {
         animation.duration = 0.4
         target.layer.add(animation, forKey: "cdv.shake")
     }
-
-    // MARK: - Keyboard
-
-    private func observeKeyboard() {
-        NotificationCenter.default.addObserver(
-            self,
-            selector: #selector(keyboardWillChange(_:)),
-            name: UIResponder.keyboardWillChangeFrameNotification,
-            object: nil
-        )
-        NotificationCenter.default.addObserver(
-            self,
-            selector: #selector(keyboardWillHide),
-            name: UIResponder.keyboardWillHideNotification,
-            object: nil
-        )
-    }
-
-    @objc private func keyboardWillChange(_ note: Notification) {
-        guard
-            let frame = note.userInfo?[UIResponder.keyboardFrameEndUserInfoKey] as? CGRect
-        else { return }
-        let overlap = view.bounds.maxY - view.convert(frame, from: nil).minY
-        scrollView.contentInset.bottom = max(0, overlap)
-        scrollView.verticalScrollIndicatorInsets.bottom = max(0, overlap)
-    }
-
-    @objc private func keyboardWillHide() {
-        scrollView.contentInset.bottom = 0
-        scrollView.verticalScrollIndicatorInsets.bottom = 0
-    }
 }
 
 extension ReporterViewController: UITextViewDelegate {
     func textViewDidChange(_ textView: UITextView) {
-        placeholderLabel.isHidden = !textView.text.isEmpty
+        placeholderLabel.isHidden = !(textView.text ?? "").isEmpty
+        updateTitlePreview()
+    }
+}
+
+extension ReporterViewController: UIDocumentPickerDelegate {
+    func documentPicker(_ controller: UIDocumentPickerViewController, didPickDocumentsAt urls: [URL]) {
+        guard let url = urls.first else { return }
+        let scoped = url.startAccessingSecurityScopedResource()
+        defer { if scoped { url.stopAccessingSecurityScopedResource() } }
+        guard let data = try? Data(contentsOf: url) else { return }
+        let contentType = UTType(filenameExtension: url.pathExtension)?.preferredMIMEType
+            ?? "application/octet-stream"
+        attachments.append(PendingAttachment(
+            kind: .file, data: data, contentType: contentType, filename: url.lastPathComponent
+        ))
+        refreshAttachments()
     }
 }
 #endif
