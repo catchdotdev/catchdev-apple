@@ -32,6 +32,11 @@ enum DeviceContext {
         Locale.current.identifier
     }
 
+    /// IANA timezone identifier, e.g. `America/New_York`.
+    static var timezone: String {
+        TimeZone.current.identifier
+    }
+
     static var platform: String {
         #if os(iOS)
         return "ios"

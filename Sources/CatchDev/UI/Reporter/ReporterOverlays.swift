@@ -193,4 +193,17 @@ final class SuccessOverlayView: UIView {
     @available(*, unavailable)
     required init?(coder: NSCoder) { fatalError() }
 }
+
+/// A label with symmetric text insets (used by the success overlay's report-id chip).
+final class PaddedLabel: UILabel {
+    var insets = UIEdgeInsets(top: 1, left: 6, bottom: 1, right: 6)
+    override func drawText(in rect: CGRect) {
+        super.drawText(in: rect.inset(by: insets))
+    }
+    override var intrinsicContentSize: CGSize {
+        let size = super.intrinsicContentSize
+        return CGSize(width: size.width + insets.left + insets.right,
+                      height: size.height + insets.top + insets.bottom)
+    }
+}
 #endif

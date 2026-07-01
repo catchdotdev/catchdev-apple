@@ -85,6 +85,8 @@ struct FeedbackReport: Codable {
     /// `screenName` multipart field.
     var screenName: String?
     var locale: String?
+    /// IANA timezone identifier, e.g. `America/New_York`.
+    var timezone: String?
 
     var sdk: String = SDKInfo.name
     var sdkVersion: String = SDKInfo.version
@@ -128,7 +130,7 @@ struct FeedbackReport: Codable {
     private enum CodingKeys: String, CodingKey {
         case message, type, severity, area
         case email, userId, appVersion, appBuild, osVersion, device, platform
-        case environment, screenName, locale, sdk, sdkVersion, time, reportId
+        case environment, screenName, locale, timezone, sdk, sdkVersion, time, reportId
         case metadata, breadcrumbs, sessionId, failedRequests, attachments
         case imageContentType
     }
@@ -187,5 +189,6 @@ struct FeedbackReport: Codable {
         device = DeviceContext.deviceModel
         platform = DeviceContext.platform
         locale = DeviceContext.locale
+        timezone = DeviceContext.timezone
     }
 }

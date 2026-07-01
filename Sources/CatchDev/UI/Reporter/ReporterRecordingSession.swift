@@ -16,17 +16,23 @@ final class ReporterRecordingSession {
 
     var isAvailable: Bool { recorder.isAvailable }
 
-    /// The reporter has already stashed `pendingRestore` and dismissed itself; start the
-    /// capture and show the Stop control.
-    func begin() {
+    /// Start the capture. `onStarted` fires only once recording is actually rolling (the
+    /// caller dismisses the reporter there); `onUnavailable` fires if it can't start, so the
+    /// caller can keep the reporter up and inform the user instead of leaving them on a
+    /// dismissed-but-frozen screen.
+    func begin(onStarted: @escaping () -> Void, onUnavailable: @escaping () -> Void) {
+        guard recorder.isAvailable else {
+            onUnavailable()
+            return
+        }
         recorder.startRecording { [weak self] result in
             DispatchQueue.main.async {
                 switch result {
                 case .success:
+                    onStarted()
                     self?.showStopControl()
                 case .failure:
-                    // Couldn't start — just reopen the form with the draft intact.
-                    CatchDev.shared.presentReporter()
+                    onUnavailable()
                 }
             }
         }

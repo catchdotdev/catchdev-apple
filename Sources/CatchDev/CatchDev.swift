@@ -44,6 +44,8 @@ public final class CatchDev: NSObject {
     private var breadcrumbsEnabled = true
     private var networkCaptureEnabled = false
     private var shakeEnabled = true
+    private var contactFieldEnabled = false
+    private var screenshotAttachmentEnabled = true
     private var shakeInstalled = false
     private var trackerInstalled = false
     private var presentingReporter = false
@@ -101,6 +103,15 @@ public final class CatchDev: NSObject {
         shared.setUser(id: id, email: email)
     }
 
+    /// Set (or clear) just the end user's email — a first-class way to pre-fill the report's
+    /// contact address without prompting. Used as the report email whenever the in-reporter
+    /// Contact field is hidden or left blank. Preserves any previously set user id.
+    @objc public static func setUserEmail(_ email: String?) {
+        shared.withLock { state in
+            state.user = FeedbackUser(id: state.user?.id, email: email)
+        }
+    }
+
     /// Attach arbitrary custom key/values to subsequent reports.
     @objc public static func setMetadata(_ metadata: [String: String]) {
         shared.setMetadata(metadata)
@@ -132,6 +143,22 @@ public final class CatchDev: NSObject {
             ShakeDetector.shared.isEnabled = newValue
             #endif
         }
+    }
+
+    /// Whether the reporter shows the **Contact email** field. Defaults to `false` — most
+    /// apps identify the user via ``setUser(id:email:)`` / ``setUserEmail(_:)`` instead of
+    /// asking again. When shown, a non-empty entry overrides the configured user email.
+    @objc public static var isContactFieldEnabled: Bool {
+        get { shared.withLock { $0.contactFieldEnabled } }
+        set { shared.withLock { $0.contactFieldEnabled = newValue } }
+    }
+
+    /// Whether a screenshot of the screen that spawned the reporter is automatically
+    /// attached. Defaults to `true`. Disable for apps that never want an auto-capture (the
+    /// user can still add one with the Screenshot tool).
+    @objc public static var isScreenshotAttachmentEnabled: Bool {
+        get { shared.withLock { $0.screenshotAttachmentEnabled } }
+        set { shared.withLock { $0.screenshotAttachmentEnabled = newValue } }
     }
 
     /// Whether the SDK automatically records a breadcrumb trail of visited screens (sent
@@ -511,8 +538,9 @@ public final class CatchDev: NSObject {
                 reporter = ReporterViewController(restoring: restore)
             } else {
                 let screenName = ScreenName.resolve(presenter)
+                let attachShot = self.withLock { $0.screenshotAttachmentEnabled }
                 reporter = ReporterViewController(
-                    screenshot: ScreenshotCapturer.capture(),
+                    screenshot: attachShot ? ScreenshotCapturer.capture() : nil,
                     screenName: screenName
                 )
             }

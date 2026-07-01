@@ -20,9 +20,9 @@ final class CatchDevExampleUITests: XCTestCase {
         continueAfterFailure = false
     }
 
-    private func launchApp() -> XCUIApplication {
+    private func launchApp(extraArgs: [String] = []) -> XCUIApplication {
         let app = XCUIApplication()
-        app.launchArguments += ["-CatchDevUITest"]
+        app.launchArguments += ["-CatchDevUITest"] + extraArgs
         app.launch()
         return app
     }
@@ -101,18 +101,6 @@ final class CatchDevExampleUITests: XCTestCase {
         XCTAssertTrue(area.label.contains("Payments"), "Area button should reflect the choice")
     }
 
-    func testDiagnosticsDisclosureExpandsAndToggles() {
-        let app = launchApp()
-        openReporter(app)
-        app.buttons["catchdev.reporter.diagnostics"].tap()
-        // Expanding reveals per-item exclude toggles (Device is always collected).
-        let deviceToggle = app.switches["catchdev.reporter.diagnostics.toggle.device"]
-        XCTAssertTrue(deviceToggle.waitForExistence(timeout: 3),
-                      "Diagnostics disclosure should expand to reveal per-item toggles")
-        XCTAssertEqual(deviceToggle.value as? String, "1", "Diagnostics are included by default")
-        deviceToggle.tap() // exclude — the toggle is interactive
-    }
-
     func testAutoTitleAppears() {
         let app = launchApp()
         let message = openReporter(app)
@@ -155,5 +143,19 @@ final class CatchDevExampleUITests: XCTestCase {
         // Screenshot (0) + recording (1) are both attached.
         XCTAssertTrue(app.otherElements["catchdev.reporter.attachment.1"].waitForExistence(timeout: 3),
                       "The recording should be added as a second attachment")
+    }
+
+    /// Regression: when recording can't start (Simulator / permission denied), the reporter
+    /// must stay open with an alert — NOT dismiss and leave the host screen frozen.
+    func testRecordUnavailableKeepsReporterOpenAndInteractive() {
+        let app = launchApp(extraArgs: ["-CatchDevRecordingUnavailable"])
+        let message = openReporter(app)
+        app.buttons["catchdev.reporter.tool.record"].tap()
+        let ok = app.alerts.buttons["OK"]
+        XCTAssertTrue(ok.waitForExistence(timeout: 5), "An 'unavailable' alert should appear")
+        ok.tap()
+        XCTAssertTrue(message.exists, "Reporter should remain open after an unavailable recording")
+        XCTAssertTrue(app.buttons["catchdev.reporter.send"].isHittable,
+                      "The reporter should still be interactive (not frozen)")
     }
 }

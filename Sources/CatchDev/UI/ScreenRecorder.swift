@@ -19,11 +19,22 @@ final class ScreenRecorder {
         ProcessInfo.processInfo.arguments.contains("-CatchDevUITest")
     }
 
+    /// UI-test hook: force recording to report unavailable, to exercise the graceful
+    /// "reporter stays open + shows an alert" path (the real device/permission-denied case).
+    static var isUITestForceUnavailable: Bool {
+        ProcessInfo.processInfo.arguments.contains("-CatchDevRecordingUnavailable")
+    }
+
     private(set) var isRecording = false
 
     var isAvailable: Bool {
+        if Self.isUITestForceUnavailable { return false }
         if Self.isUITestStub { return true }
-        #if canImport(ReplayKit)
+        #if targetEnvironment(simulator)
+        // ReplayKit in-app capture doesn't produce a usable file on the Simulator; report
+        // unavailable so the reporter shows a graceful message instead of a broken recording.
+        return false
+        #elseif canImport(ReplayKit)
         return RPScreenRecorder.shared().isAvailable
         #else
         return false

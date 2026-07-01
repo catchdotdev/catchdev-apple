@@ -32,6 +32,7 @@ final class FeedbackClient {
         report.environment.map { form.addField(name: "environment", value: $0) }
         report.screenName.map { form.addField(name: "screenName", value: $0) }
         report.locale.map { form.addField(name: "locale", value: $0) }
+        report.timezone.map { form.addField(name: "timezone", value: $0) }
         form.addField(name: "sdk", value: report.sdk)
         form.addField(name: "sdkVersion", value: report.sdkVersion)
         form.addField(name: "time", value: report.time)

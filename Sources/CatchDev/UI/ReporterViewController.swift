@@ -49,7 +49,6 @@ final class ReporterViewController: UIViewController {
     private let areaDropdown = AreaDropdownView()
     private let attachmentsView = AttachmentsView()
     private let contactField = UITextField()
-    private let diagnosticsView = DiagnosticsView()
     private let footerView = UIView()
     private let sendButton = UIButton(type: .system)
 
@@ -104,7 +103,6 @@ final class ReporterViewController: UIViewController {
             seedScreenshot(screenshot)
         }
         refreshForTab(animated: false)
-        refreshDiagnostics()
         refreshAttachments()
     }
 
@@ -128,9 +126,15 @@ final class ReporterViewController: UIViewController {
         close.tintColor = ReporterTheme.textSoft
         close.accessibilityIdentifier = CatchDevReporterAccessibility.close
         close.accessibilityLabel = "Close"
+        close.setContentHuggingPriority(.required, for: .horizontal)
         close.addAction(UIAction { [weak self] _ in self?.dismiss(animated: true) }, for: .touchUpInside)
 
-        let bar = UIStackView(arrangedSubviews: [title, close])
+        // A low-hugging spacer absorbs the slack so the close button sits at the trailing edge.
+        let spacer = UIView()
+        spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        spacer.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+
+        let bar = UIStackView(arrangedSubviews: [title, spacer, close])
         bar.axis = .horizontal
         bar.alignment = .center
         bar.translatesAutoresizingMaskIntoConstraints = false
@@ -184,10 +188,9 @@ final class ReporterViewController: UIViewController {
         contentStack.addArrangedSubview(severitySection)
         contentStack.addArrangedSubview(makeAreaSection())
         contentStack.addArrangedSubview(makeAttachmentsSection())
-        contentStack.addArrangedSubview(makeContactSection())
-        contentStack.addArrangedSubview(diagnosticsView)
-
-        diagnosticsView.onChange = { [weak self] excluded in self?.excluded = excluded }
+        if CatchDev.isContactFieldEnabled {
+            contentStack.addArrangedSubview(makeContactSection())
+        }
     }
 
     private func makeDescriptionSection() -> UIView {
@@ -393,10 +396,6 @@ final class ReporterViewController: UIViewController {
         attachmentsView.setAttachments(attachments)
     }
 
-    private func refreshDiagnostics() {
-        diagnosticsView.configure(items: buildDiagnosticItems())
-    }
-
     // MARK: - Attachments
 
     private func seedScreenshot(_ image: UIImage) {
@@ -450,35 +449,6 @@ final class ReporterViewController: UIViewController {
         present(picker, animated: true)
     }
 
-    // MARK: - Diagnostics list
-
-    private func buildDiagnosticItems() -> [DiagnosticItem] {
-        var items: [DiagnosticItem] = []
-        if let screenName, !screenName.isEmpty {
-            items.append(.init(id: .screen, icon: "rectangle.on.rectangle", title: "Current screen", value: screenName, locked: false))
-        }
-        let version = [DeviceContext.appVersion, DeviceContext.appBuild.map { "(\($0))" }]
-            .compactMap { $0 }.joined(separator: " ")
-        if !version.isEmpty {
-            items.append(.init(id: .version, icon: "tag", title: "App version", value: version, locked: false))
-        }
-        let device = "\(DeviceContext.deviceModel) · \(DeviceContext.osVersion)"
-        items.append(.init(id: .device, icon: "iphone", title: "Device & OS", value: device, locked: false))
-        if let userId = CatchDev.shared.currentUserId, !userId.isEmpty {
-            items.append(.init(id: .user, icon: "person", title: "User ID", value: userId, locked: false))
-        }
-        let crumbs = CatchDev.shared.breadcrumbCount
-        if crumbs > 0 {
-            items.append(.init(id: .breadcrumbs, icon: "hand.tap", title: "Recent screens", value: "\(crumbs) breadcrumbs", locked: false))
-        }
-        if CatchDev.isNetworkCaptureEnabled {
-            let failed = CatchDevNetworkCapture.shared.snapshot().count
-            items.append(.init(id: .network, icon: "wifi.slash", title: "Failed network calls", value: "\(failed)", locked: false))
-        }
-        items.append(.init(id: .session, icon: "touchid", title: "Session ID", value: SessionInfo.sessionId, locked: true))
-        return items
-    }
-
     // MARK: - Send
 
     private func send() {
@@ -489,7 +459,7 @@ final class ReporterViewController: UIViewController {
             return
         }
         view.endEditing(true)
-        let contact = contactField.text
+        let contact = CatchDev.isContactFieldEnabled ? contactField.text : nil
         let pending = attachments
 
         let overlay = SendingOverlayView(steps: [
@@ -595,27 +565,33 @@ final class ReporterViewController: UIViewController {
     // MARK: - Record
 
     private func startRecording() {
-        guard ReporterRecordingSession.shared.isAvailable else {
-            let alert = UIAlertController(
-                title: "Recording unavailable",
-                message: "Screen recording isn’t available on this device.",
-                preferredStyle: .alert
-            )
-            alert.addAction(UIAlertAction(title: "OK", style: .default))
-            present(alert, animated: true)
-            return
-        }
         currentDraft = descriptionTextView.text ?? ""
         ReporterViewController.pendingRestore = ReporterRestoreState(
             drafts: drafts, tab: reportType, severity: severity, area: area,
             contact: contactField.text ?? "", excluded: excluded,
             attachments: attachments, screenName: screenName, reportId: reportId
         )
-        // The reporter deallocates once dismissed, so the recording flow is owned by a
-        // singleton that survives. The completion intentionally does not capture `self`.
-        dismiss(animated: true) {
-            ReporterRecordingSession.shared.begin()
-        }
+        // Only tear the reporter down once recording is actually rolling. If it can't start
+        // (Simulator, denied permission, ReplayKit error), keep the reporter up and tell the
+        // user — never leave them dismissed-but-frozen. The reporter deallocates on dismiss,
+        // so the recording flow is owned by a surviving singleton.
+        ReporterRecordingSession.shared.begin(
+            onStarted: { [weak self] in self?.dismiss(animated: true) },
+            onUnavailable: { [weak self] in
+                ReporterViewController.pendingRestore = nil
+                self?.presentRecordingUnavailable()
+            }
+        )
+    }
+
+    private func presentRecordingUnavailable() {
+        let alert = UIAlertController(
+            title: "Recording unavailable",
+            message: "Screen recording isn’t available on this device.",
+            preferredStyle: .alert
+        )
+        alert.addAction(UIAlertAction(title: "OK", style: .default))
+        present(alert, animated: true)
     }
 
     private func apply(_ state: ReporterRestoreState) {

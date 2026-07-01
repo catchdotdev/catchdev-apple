@@ -117,6 +117,45 @@ final class ReporterWireTests: XCTestCase {
         XCTAssertFalse(body.contains("configured@x.com"))
     }
 
+    func testSubmitFallsBackToConfiguredUserEmailWhenNoContact() {
+        var body = ""
+        let captured = expectation(description: "captured")
+        let session = URLSession(configuration: MockURLProtocol.sessionConfiguration())
+        MockURLProtocol.handler = { request in
+            body = Self.bodyString(request)
+            captured.fulfill()
+            let response = HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!
+            return (response, Data("{\"id\":\"x\"}".utf8))
+        }
+        let sdk = CatchDev(client: FeedbackClient(session: session, boundaryProvider: { "B" }))
+        sdk.configure(apiKey: "k", endpoint: endpoint)
+        sdk.setUser(id: "u1", email: "configured@x.com")
+
+        // No contact typed (the field is hidden by default) → the report uses the set email.
+        sdk.submit(message: "x", imageData: nil, contactEmail: nil) { _ in }
+        wait(for: [captured], timeout: 5)
+        XCTAssertTrue(body.contains("name=\"email\"\r\n\r\nconfigured@x.com"))
+    }
+
+    func testSubmitSendsLocaleAndTimezone() {
+        var body = ""
+        let captured = expectation(description: "captured")
+        let session = URLSession(configuration: MockURLProtocol.sessionConfiguration())
+        MockURLProtocol.handler = { request in
+            body = Self.bodyString(request)
+            captured.fulfill()
+            let response = HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!
+            return (response, Data("{\"id\":\"x\"}".utf8))
+        }
+        let sdk = CatchDev(client: FeedbackClient(session: session, boundaryProvider: { "B" }))
+        sdk.configure(apiKey: "k", endpoint: endpoint)
+
+        sdk.submit(message: "x", imageData: nil) { _ in }
+        wait(for: [captured], timeout: 5)
+        XCTAssertTrue(body.contains("name=\"locale\""), "locale should be attached")
+        XCTAssertTrue(body.contains("name=\"timezone\""), "timezone should be attached")
+    }
+
     // MARK: - Helper
 
     private static func bodyString(_ request: URLRequest) -> String {
