@@ -148,23 +148,21 @@ public final class CatchDev: NSObject {
         set { withLock { $0.breadcrumbsEnabled = newValue } }
     }
 
-    /// Whether the SDK captures the host app's FAILED network calls (non-2xx responses +
-    /// transport errors) for the reporter's "Failed network calls" diagnostic. **Off by
-    /// default** — it installs a global `URLProtocol` interceptor, so enable it
-    /// deliberately. Records are redacted to method + host/path + status; see
-    /// ``CatchDevNetworkCapture`` for the best-effort coverage caveats.
+    /// Whether the SDK includes captured FAILED host network calls (non-2xx responses +
+    /// transport errors) in the reporter's "Failed network calls" diagnostic. **Off by
+    /// default.** The SDK does NOT intercept the host's `URLSession` (that would break
+    /// cookies/auth/pinning/uploads); when enabled, the host reports failures via
+    /// ``recordFailedRequest(method:url:status:)`` — e.g. from a `URLSession` delegate or an
+    /// Alamofire event monitor. Records are redacted to method + host/path + status.
     @objc public static var isNetworkCaptureEnabled: Bool {
         get { shared.withLock { $0.networkCaptureEnabled } }
-        set {
-            let shouldInstall = shared.withLock { state -> Bool in
-                let wasEnabled = state.networkCaptureEnabled
-                state.networkCaptureEnabled = newValue
-                return newValue && !wasEnabled
-            }
-            // The interceptor can't be uninstalled once swizzled; toggling off simply
-            // stops the snapshot from being attached at submit time.
-            if shouldInstall { CatchDevNetworkCapture.shared.install() }
-        }
+        set { shared.withLock { $0.networkCaptureEnabled = newValue } }
+    }
+
+    /// Report a failed host request for the diagnostic. No-op unless capture is enabled.
+    @objc public static func recordFailedRequest(method: String, url: String, status: Int) {
+        guard shared.withLock({ $0.networkCaptureEnabled }) else { return }
+        CatchDevNetworkCapture.shared.record(method: method, url: url, status: status)
     }
 
     /// Print SDK diagnostics to the console. Off by default — useful while integrating.

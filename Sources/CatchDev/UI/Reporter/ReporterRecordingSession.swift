@@ -44,13 +44,16 @@ final class ReporterRecordingSession {
         window = nil
         recorder.stopRecording { result in
             DispatchQueue.main.async {
-                if case .success(let url) = result, let data = try? Data(contentsOf: url) {
-                    ReporterViewController.pendingRestore?.attachments.append(
-                        PendingAttachment(
-                            kind: .recording, data: data,
-                            contentType: "video/mp4", filename: "recording.mp4"
+                if case .success(let url) = result {
+                    if let data = try? Data(contentsOf: url) {
+                        ReporterViewController.pendingRestore?.attachments.append(
+                            PendingAttachment(
+                                kind: .recording, data: data,
+                                contentType: "video/mp4", filename: "recording.mp4"
+                            )
                         )
-                    )
+                    }
+                    try? FileManager.default.removeItem(at: url) // don't leak the temp .mp4
                 }
                 CatchDev.shared.presentReporter()
             }

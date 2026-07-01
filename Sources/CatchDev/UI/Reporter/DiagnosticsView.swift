@@ -185,8 +185,11 @@ final class DiagnosticsView: UIView {
             toggle.isOn = !excluded.contains(item.id)
             toggle.transform = CGAffineTransform(scaleX: 0.82, y: 0.82)
             toggle.accessibilityIdentifier = CatchDevReporterAccessibility.diagnosticsToggle(item.id)
-            toggle.addAction(UIAction { [weak self] _ in
-                self?.setExcluded(item.id, excluded: !toggle.isOn)
+            // Read the switch from the action's sender (don't capture `toggle` — that would
+            // form a switch → action → switch retain cycle that leaks per presentation).
+            toggle.addAction(UIAction { [weak self] action in
+                let isOn = (action.sender as? UISwitch)?.isOn ?? true
+                self?.setExcluded(item.id, excluded: !isOn)
             }, for: .valueChanged)
             trailing = toggle
         }
