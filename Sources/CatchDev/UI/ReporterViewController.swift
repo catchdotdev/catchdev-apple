@@ -36,6 +36,10 @@ final class ReporterViewController: UIViewController {
     private var area: String?
     private var attachments: [PendingAttachment] = []
     private var excluded: Set<DiagnosticID> = []
+    private var isStartingRecording = false
+    // Snapshot the global toggle once per presentation so `buildBody` (shows the field) and
+    // `send` (reads it) always agree, even if a host flips the flag while the reporter is up.
+    private let contactFieldEnabled = CatchDev.isContactFieldEnabled
 
     // Views
     private let scrollView = UIScrollView()
@@ -188,7 +192,7 @@ final class ReporterViewController: UIViewController {
         contentStack.addArrangedSubview(severitySection)
         contentStack.addArrangedSubview(makeAreaSection())
         contentStack.addArrangedSubview(makeAttachmentsSection())
-        if CatchDev.isContactFieldEnabled {
+        if contactFieldEnabled {
             contentStack.addArrangedSubview(makeContactSection())
         }
     }
@@ -459,7 +463,7 @@ final class ReporterViewController: UIViewController {
             return
         }
         view.endEditing(true)
-        let contact = CatchDev.isContactFieldEnabled ? contactField.text : nil
+        let contact = contactFieldEnabled ? contactField.text : nil
         let pending = attachments
 
         let overlay = SendingOverlayView(steps: [
@@ -565,6 +569,11 @@ final class ReporterViewController: UIViewController {
     // MARK: - Record
 
     private func startRecording() {
+        // Debounce: the reporter stays up during ReplayKit's async start, so a second tap
+        // could double-start the recorder (→ two Stop pills, or a lost draft when the second
+        // start fails and clears pendingRestore mid-recording).
+        guard !isStartingRecording else { return }
+        isStartingRecording = true
         currentDraft = descriptionTextView.text ?? ""
         ReporterViewController.pendingRestore = ReporterRestoreState(
             drafts: drafts, tab: reportType, severity: severity, area: area,
@@ -578,6 +587,7 @@ final class ReporterViewController: UIViewController {
         ReporterRecordingSession.shared.begin(
             onStarted: { [weak self] in self?.dismiss(animated: true) },
             onUnavailable: { [weak self] in
+                self?.isStartingRecording = false // let the user try again
                 ReporterViewController.pendingRestore = nil
                 self?.presentRecordingUnavailable()
             }

@@ -153,9 +153,10 @@ public final class CatchDev: NSObject {
         set { shared.withLock { $0.contactFieldEnabled = newValue } }
     }
 
-    /// Whether a screenshot of the screen that spawned the reporter is automatically
-    /// attached. Defaults to `true`. Disable for apps that never want an auto-capture (the
-    /// user can still add one with the Screenshot tool).
+    /// Whether a screenshot of the screen that spawned the reporter is automatically attached
+    /// (and available to annotate via the Screenshot tool). Defaults to `true`. Disable for
+    /// apps that never want an auto-capture — the reporter then opens with no screenshot, and
+    /// the user attaches evidence via the File tool instead.
     @objc public static var isScreenshotAttachmentEnabled: Bool {
         get { shared.withLock { $0.screenshotAttachmentEnabled } }
         set { shared.withLock { $0.screenshotAttachmentEnabled = newValue } }
