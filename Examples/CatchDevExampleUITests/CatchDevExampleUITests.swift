@@ -101,6 +101,18 @@ final class CatchDevExampleUITests: XCTestCase {
         XCTAssertTrue(area.label.contains("Payments"), "Area button should reflect the choice")
     }
 
+    func testDiagnosticsDisclosureExpandsAndToggles() {
+        let app = launchApp()
+        openReporter(app)
+        app.buttons["catchdev.reporter.diagnostics"].tap()
+        // Expanding reveals per-item exclude toggles (Device is always collected).
+        let deviceToggle = app.switches["catchdev.reporter.diagnostics.toggle.device"]
+        XCTAssertTrue(deviceToggle.waitForExistence(timeout: 3),
+                      "Diagnostics disclosure should expand to reveal per-item toggles")
+        XCTAssertEqual(deviceToggle.value as? String, "1", "Diagnostics are included by default")
+        deviceToggle.tap() // exclude — the toggle is interactive
+    }
+
     func testAutoTitleAppears() {
         let app = launchApp()
         let message = openReporter(app)
