@@ -107,6 +107,12 @@ final class AttachmentsView: UIView {
         card.translatesAutoresizingMaskIntoConstraints = false
         card.backgroundColor = ReporterTheme.mutedBg
         card.layer.cornerRadius = 12
+        // Without a border a light screenshot is indistinguishable from the sheet behind it —
+        // the thumbnail reads as floating in space. Drawn on the card's own layer, so it sits
+        // above the image (CALayer renders its border above its sublayers) and applies to every
+        // attachment kind. Matches the 1pt border on the description box and the Area field.
+        card.layer.borderWidth = 1
+        card.layer.borderColor = ReporterTheme.border.cgColor
         card.clipsToBounds = true
         card.accessibilityIdentifier = CatchDevReporterAccessibility.attachment(index)
         NSLayoutConstraint.activate([
