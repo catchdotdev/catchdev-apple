@@ -13,9 +13,8 @@ public enum CatchDevReporterAccessibility {
     public static let tabFeedback = "catchdev.reporter.tab.feedback"
     public static let tabBug = "catchdev.reporter.tab.bug"
 
-    // Description + derived title
+    // Description
     public static let message = "catchdev.reporter.message"
-    public static let titlePreview = "catchdev.reporter.title"
 
     // Severity (bug only)
     public static func severity(_ value: Severity) -> String {
@@ -24,6 +23,7 @@ public enum CatchDevReporterAccessibility {
 
     // Area dropdown
     public static let area = "catchdev.reporter.area"
+    public static let areaClear = "catchdev.reporter.area.clear"
     public static func areaOption(_ name: String) -> String {
         "catchdev.reporter.area.\(name.lowercased())"
     }
@@ -67,6 +67,8 @@ public enum CatchDevReporterAccessibility {
     // Sending / success overlays
     public static let sending = "catchdev.reporter.sending"
     public static let success = "catchdev.reporter.success"
+    /// The success overlay in its offline "saved, we'll send it later" form.
+    public static let queued = "catchdev.reporter.queued"
     public static let successDone = "catchdev.reporter.success.done"
 }
 #endif

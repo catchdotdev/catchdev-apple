@@ -113,33 +113,42 @@ final class SendingOverlayView: UIView {
     }
 }
 
-/// The success overlay: a green check, the returned report id, and a Done action.
+/// The success overlay: a check, the report id, and a Done action. When `queued` (the report
+/// is durably saved but the device is offline) it says so — a success-style state, never an
+/// error: the SDK delivers it on reconnect.
 final class SuccessOverlayView: UIView {
     var onDone: (() -> Void)?
 
-    init(type: ReportType, reportId: String) {
+    init(type: ReportType, reportId: String, queued: Bool = false) {
         super.init(frame: .zero)
         backgroundColor = ReporterTheme.bg
-        accessibilityIdentifier = CatchDevReporterAccessibility.success
+        accessibilityIdentifier = queued
+            ? CatchDevReporterAccessibility.queued
+            : CatchDevReporterAccessibility.success
 
         let checkWrap = UIView()
         checkWrap.backgroundColor = ReporterTheme.bugAccentBg
         checkWrap.layer.cornerRadius = 32
         checkWrap.translatesAutoresizingMaskIntoConstraints = false
-        let check = UIImageView(image: ReporterStyle.symbolImage("checkmark", pointSize: 28, weight: .bold))
+        let symbol = queued ? "clock.arrow.circlepath" : "checkmark"
+        let check = UIImageView(image: ReporterStyle.symbolImage(symbol, pointSize: 28, weight: .bold))
         check.tintColor = ReporterTheme.bugAccent
         check.translatesAutoresizingMaskIntoConstraints = false
         checkWrap.addSubview(check)
 
         let title = UILabel()
-        title.text = "Report sent"
+        title.text = queued ? "Saved for later" : "Report sent"
         title.font = .systemFont(ofSize: 18, weight: .semibold)
         title.textColor = ReporterTheme.text
 
         let subtitle = UILabel()
-        subtitle.text = type == .bug
-            ? "Thanks — the team can see exactly what happened."
-            : "Thanks for helping make this better."
+        if queued {
+            subtitle.text = "You're offline — we'll send it when you're back online."
+        } else {
+            subtitle.text = type == .bug
+                ? "Thanks — the team can see exactly what happened."
+                : "Thanks for helping make this better."
+        }
         subtitle.font = .systemFont(ofSize: 13.5)
         subtitle.textColor = ReporterTheme.textMuted
         subtitle.textAlignment = .center

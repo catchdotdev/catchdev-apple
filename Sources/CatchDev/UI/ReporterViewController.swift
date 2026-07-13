@@ -47,7 +47,6 @@ final class ReporterViewController: UIViewController {
     private let tabsView = SegmentedTabsView()
     private let descriptionTextView = UITextView()
     private let placeholderLabel = UILabel()
-    private let titlePreviewLabel = UILabel()
     private let severityView = SeverityView()
     private var severitySection: UIView!
     private let areaDropdown = AreaDropdownView()
@@ -230,15 +229,7 @@ final class ReporterViewController: UIViewController {
             placeholderLabel.leadingAnchor.constraint(equalTo: box.leadingAnchor, constant: 15),
         ])
 
-        titlePreviewLabel.font = .systemFont(ofSize: 12)
-        titlePreviewLabel.textColor = ReporterTheme.textMuted
-        titlePreviewLabel.accessibilityIdentifier = CatchDevReporterAccessibility.titlePreview
-        titlePreviewLabel.isHidden = true
-
-        let column = UIStackView(arrangedSubviews: [box, titlePreviewLabel])
-        column.axis = .vertical
-        column.spacing = 8
-        return column
+        return box
     }
 
     private func makeSeveritySection() -> UIView {
@@ -254,6 +245,7 @@ final class ReporterViewController: UIViewController {
 
     private func makeAreaSection() -> UIView {
         areaDropdown.onChange = { [weak self] value in self?.area = value }
+        areaDropdown.onOpen = { [weak self] in self?.presentAreaPicker() }
         let column = UIStackView(arrangedSubviews: [
             ReporterStyle.sectionLabel("Area", optional: true),
             areaDropdown,
@@ -368,7 +360,6 @@ final class ReporterViewController: UIViewController {
             ? "What happened? What did you expect?"
             : "What would make this better?"
         placeholderLabel.isHidden = !currentDraft.isEmpty
-        updateTitlePreview()
         tabsView.setSelected(reportType, animated: animated)
         let show = reportType == .bug
         UIView.animate(withDuration: animated ? 0.2 : 0) {
@@ -376,24 +367,15 @@ final class ReporterViewController: UIViewController {
         }
     }
 
-    private func updateTitlePreview() {
-        let title = Self.deriveTitle(descriptionTextView.text ?? "")
-        if let title {
-            titlePreviewLabel.text = "TITLE  “\(title)” · auto"
-            titlePreviewLabel.isHidden = false
-        } else {
-            titlePreviewLabel.isHidden = true
+    private func presentAreaPicker() {
+        descriptionTextView.resignFirstResponder()
+        let picker = AreaPickerSheetViewController(
+            areas: AreaDropdownView.areas,
+            selected: areaDropdown.selected
+        ) { [weak self] area in
+            self?.areaDropdown.choose(area)
         }
-    }
-
-    static func deriveTitle(_ text: String) -> String? {
-        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-            .replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
-        guard trimmed.count >= 6 else { return nil }
-        let words = trimmed.split(separator: " ")
-        let head = words.prefix(7).joined(separator: " ")
-        let capitalized = head.prefix(1).uppercased() + head.dropFirst()
-        return capitalized + (words.count > 7 ? "…" : "")
+        present(picker, animated: true)
     }
 
     private func refreshAttachments() {
@@ -464,71 +446,51 @@ final class ReporterViewController: UIViewController {
         }
         view.endEditing(true)
         let contact = contactFieldEnabled ? contactField.text : nil
-        let pending = attachments
+        // Hand the RAW bytes to the SDK: it persists the report + these blobs to the durable
+        // outbox BEFORE any network call, then uploads and posts. Uploading here first would
+        // fail offline before anything was saved — which is exactly the bug this replaces.
+        let pending = attachments.map {
+            PendingBlob(
+                kind: $0.kind, data: $0.data, contentType: $0.contentType,
+                filename: $0.filename, annotated: $0.annotated
+            )
+        }
 
         let overlay = SendingOverlayView(steps: [
             "Bundling breadcrumbs", "Attaching context", "Uploading attachments", "Posting to Catch",
         ])
         showOverlay(overlay)
 
-        uploadAll(pending, uploaded: []) { [weak self] result in
-            guard let self else { return }
-            switch result {
-            case .failure(let error):
-                DispatchQueue.main.async {
+        CatchDev.shared.submit(
+            message: message,
+            imageData: nil,
+            type: reportType,
+            severity: reportType == .bug ? severity : nil,
+            area: area,
+            contactEmail: contact,
+            pendingAttachments: pending,
+            reportId: reportId,
+            screenName: screenName,
+            excludedDiagnostics: excluded
+        ) { [weak self] result in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                switch result {
+                case .success(.delivered(let id)):
+                    self.showSuccess(reportId: id.isEmpty ? self.reportId : id, queued: false)
+                case .success(.queued(let id)):
+                    // Durably saved, just not sent yet — a success, not an error.
+                    self.showSuccess(reportId: id, queued: true)
+                case .failure(let error):
                     self.hideOverlay()
                     self.presentError(error)
                 }
-            case .success(let uploaded):
-                CatchDev.shared.submit(
-                    message: message,
-                    imageData: nil,
-                    type: self.reportType,
-                    severity: self.reportType == .bug ? self.severity : nil,
-                    area: self.area,
-                    contactEmail: contact,
-                    attachments: uploaded,
-                    reportId: self.reportId,
-                    screenName: self.screenName,
-                    excludedDiagnostics: self.excluded
-                ) { submitResult in
-                    DispatchQueue.main.async {
-                        switch submitResult {
-                        case .success(let id):
-                            self.showSuccess(reportId: id.isEmpty ? self.reportId : id)
-                        case .failure(let error):
-                            self.hideOverlay()
-                            self.presentError(error)
-                        }
-                    }
-                }
             }
         }
     }
 
-    /// Upload pending attachments one at a time, collecting their references.
-    private func uploadAll(
-        _ remaining: [PendingAttachment],
-        uploaded: [Attachment],
-        completion: @escaping (Result<[Attachment], Error>) -> Void
-    ) {
-        guard let next = remaining.first else { completion(.success(uploaded)); return }
-        CatchDev.shared.uploadAttachment(
-            data: next.data, kind: next.kind, contentType: next.contentType,
-            filename: next.filename, annotated: next.annotated
-        ) { [weak self] result in
-            guard let self else { return }
-            switch result {
-            case .failure(let error):
-                completion(.failure(error))
-            case .success(let attachment):
-                self.uploadAll(Array(remaining.dropFirst()), uploaded: uploaded + [attachment], completion: completion)
-            }
-        }
-    }
-
-    private func showSuccess(reportId: String) {
-        let success = SuccessOverlayView(type: reportType, reportId: reportId)
+    private func showSuccess(reportId: String, queued: Bool) {
+        let success = SuccessOverlayView(type: reportType, reportId: reportId, queued: queued)
         success.onDone = { [weak self] in self?.dismiss(animated: true) }
         showOverlay(success)
     }
@@ -652,7 +614,6 @@ final class ReporterViewController: UIViewController {
 extension ReporterViewController: UITextViewDelegate {
     func textViewDidChange(_ textView: UITextView) {
         placeholderLabel.isHidden = !(textView.text ?? "").isEmpty
-        updateTitlePreview()
     }
 }
 

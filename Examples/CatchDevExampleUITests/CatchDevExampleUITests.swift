@@ -93,21 +93,9 @@ final class CatchDevExampleUITests: XCTestCase {
         let area = app.buttons["catchdev.reporter.area"]
         area.tap()
         let option = app.buttons["catchdev.reporter.area.payments"]
-        if option.waitForExistence(timeout: 3) {
-            option.tap()
-        } else {
-            app.menuItems["catchdev.reporter.area.payments"].tap()
-        }
+        XCTAssertTrue(option.waitForExistence(timeout: 3), "The area picker sheet should open on tap")
+        option.tap()
         XCTAssertTrue(area.label.contains("Payments"), "Area button should reflect the choice")
-    }
-
-    func testAutoTitleAppears() {
-        let app = launchApp()
-        let message = openReporter(app)
-        message.tap()
-        message.typeText("The settings page never loads my profile")
-        XCTAssertTrue(app.staticTexts["catchdev.reporter.title"].waitForExistence(timeout: 3),
-                      "An auto-derived title should appear once enough text is typed")
     }
 
     func testScreenshotAttachmentIsPresentByDefault() {
