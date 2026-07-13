@@ -92,10 +92,50 @@ final class CatchDevExampleUITests: XCTestCase {
         openReporter(app)
         let area = app.buttons["catchdev.reporter.area"]
         area.tap()
-        let option = app.buttons["catchdev.reporter.area.payments"]
-        XCTAssertTrue(option.waitForExistence(timeout: 3), "The area picker sheet should open on tap")
-        option.tap()
+
+        // The options live on a picker wheel, so there are no per-row elements to tap:
+        // spin the wheel, then commit with Done.
+        let wheel = app.pickerWheels.firstMatch
+        XCTAssertTrue(wheel.waitForExistence(timeout: 3), "The area picker sheet should open on tap")
+        wheel.adjust(toPickerWheelValue: "Payments")
+        app.buttons["catchdev.reporter.area.done"].tap()
+
         XCTAssertTrue(area.label.contains("Payments"), "Area button should reflect the choice")
+    }
+
+    func testAreaCancelKeepsThePreviousValue() {
+        let app = launchApp()
+        openReporter(app)
+        let area = app.buttons["catchdev.reporter.area"]
+
+        area.tap()
+        app.pickerWheels.firstMatch.adjust(toPickerWheelValue: "Payments")
+        app.buttons["catchdev.reporter.area.done"].tap()
+
+        // Spinning the wheel and then cancelling must NOT commit the new row.
+        area.tap()
+        app.pickerWheels.firstMatch.adjust(toPickerWheelValue: "Performance")
+        app.buttons["catchdev.reporter.area.cancel"].tap()
+
+        XCTAssertTrue(area.label.contains("Payments"), "Cancel should leave the previous area intact")
+    }
+
+    func testAreaNoneRowClearsTheSelection() {
+        let app = launchApp()
+        openReporter(app)
+        let area = app.buttons["catchdev.reporter.area"]
+
+        area.tap()
+        app.pickerWheels.firstMatch.adjust(toPickerWheelValue: "Payments")
+        app.buttons["catchdev.reporter.area.done"].tap()
+        XCTAssertTrue(area.label.contains("Payments"))
+
+        // Area is optional: the synthetic "None" row is how a wheel expresses "no selection".
+        area.tap()
+        app.pickerWheels.firstMatch.adjust(toPickerWheelValue: "None")
+        app.buttons["catchdev.reporter.area.done"].tap()
+
+        XCTAssertTrue(area.label.contains("Choose an area"), "None should clear the area back to the placeholder")
     }
 
     func testScreenshotAttachmentIsPresentByDefault() {

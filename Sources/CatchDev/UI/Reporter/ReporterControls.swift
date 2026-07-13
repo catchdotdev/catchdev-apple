@@ -212,7 +212,6 @@ final class SeverityView: UIView {
 // MARK: - Area dropdown
 
 final class AreaDropdownView: UIView {
-    static let areas = ["Login", "Payments", "Performance", "Other"]
     var onChange: ((String?) -> Void)?
     /// Fired when the field is tapped; the reporter presents the picker sheet.
     var onOpen: (() -> Void)?

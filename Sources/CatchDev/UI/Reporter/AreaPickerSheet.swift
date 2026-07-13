@@ -1,27 +1,40 @@
 #if canImport(UIKit)
 import UIKit
 
-/// Bottom-anchored area selector.
+/// Bottom-anchored **Area** picker: a `UIPickerView` wheel in a sheet, with a Cancel/Done bar.
 ///
-/// Replaces the `UIMenu` popover, which floated over the Area field itself — the field
-/// appeared to vanish and reappear as the menu covered it. A sheet keeps the field in
-/// place and reads as a deliberate selection step.
+/// A wheel always has a value under the indicator, so "no area" has to be an explicit row —
+/// index 0 is a synthetic "None" (``noneTitle``) rather than a real area. Selection is
+/// committed on **Done**; Cancel (and a swipe-down) leave the previous value untouched.
 ///
-/// Rows are real `UIButton`s (not `UIAlertAction`s) so they can carry the
-/// `catchdev.reporter.area.*` accessibility identifiers the UI tests select on;
-/// `UIAlertAction` has no public identifier hook.
+/// The areas come from ``CatchDev/areas``, so a host can supply as many as it likes; the wheel
+/// scrolls. A popover menu was tried first and covered the very field it belonged to.
 final class AreaPickerSheetViewController: UIViewController {
+    /// The synthetic first row. Area is optional, and a wheel cannot express "nothing selected".
+    static let noneTitle = "None"
+
     private let areas: [String]
-    private let selectedArea: String?
     private let onPick: (String?) -> Void
 
-    private let rowHeight: CGFloat = 52
-    private let headerHeight: CGFloat = 52
+    /// Home-indicator inset, passed in by the presenter. The sheet's own `safeAreaInsets` are
+    /// still zero when the detent resolver runs, so reading them there sizes the sheet ~34pt
+    /// short and clips the bottom rows off the wheel.
+    private let bottomInset: CGFloat
 
-    init(areas: [String], selected: String?, onPick: @escaping (String?) -> Void) {
+    /// Row currently under the indicator. 0 == None, so a real area is `rows[selectedRow]`.
+    private var selectedRow: Int
+    private let picker = UIPickerView()
+
+    /// Wheel rows: the synthetic None, then every configured area.
+    private var rows: [String] { [Self.noneTitle] + areas }
+
+    init(areas: [String], selected: String?, bottomInset: CGFloat, onPick: @escaping (String?) -> Void) {
         self.areas = areas
-        self.selectedArea = selected
         self.onPick = onPick
+        self.bottomInset = bottomInset
+        // An area that is no longer in the list (the host changed `areas` after a pick) falls
+        // back to None rather than silently selecting whatever now sits at that index.
+        self.selectedRow = selected.flatMap { areas.firstIndex(of: $0).map { $0 + 1 } } ?? 0
         super.init(nibName: nil, bundle: nil)
         modalPresentationStyle = .pageSheet
     }
@@ -29,60 +42,68 @@ final class AreaPickerSheetViewController: UIViewController {
     @available(*, unavailable)
     required init?(coder: NSCoder) { fatalError() }
 
-    /// Height of the sheet's own content, so it hugs its rows rather than sitting at a
-    /// half-screen detent with dead space below. Each row carries a 1pt separator, and the
-    /// detent spans the home-indicator inset, so both are counted.
-    private var contentHeight: CGFloat {
-        let clearRow = selectedArea == nil ? 0 : rowHeight + 1
-        return headerHeight
-            + CGFloat(areas.count) * (rowHeight + 1)
-            + clearRow
-            + view.safeAreaInsets.bottom
-            + 8
-    }
+    private let barHeight: CGFloat = 52
+    private let wheelHeight: CGFloat = 216 // UIPickerView's natural height.
 
     override func viewDidLoad() {
         super.viewDidLoad()
         view.backgroundColor = ReporterTheme.bg
         configureSheet()
 
-        let header = UILabel()
-        header.text = "Area"
-        header.font = .systemFont(ofSize: 16, weight: .semibold)
-        header.textColor = ReporterTheme.text
-        header.textAlignment = .center
-        header.heightAnchor.constraint(equalToConstant: headerHeight).isActive = true
-
-        let stack = UIStackView(arrangedSubviews: [header])
-        stack.axis = .vertical
-        stack.translatesAutoresizingMaskIntoConstraints = false
-
-        for area in areas {
-            stack.addArrangedSubview(separator())
-            stack.addArrangedSubview(makeRow(
-                title: area,
-                isSelected: area == selectedArea,
-                destructive: false,
-                identifier: CatchDevReporterAccessibility.areaOption(area)
-            ) { [weak self] in self?.pick(area) })
+        let cancel = barButton(title: "Cancel", id: CatchDevReporterAccessibility.areaCancel) { [weak self] in
+            self?.dismiss(animated: true)
         }
+        cancel.setTitleColor(ReporterTheme.textMuted, for: .normal)
 
-        if selectedArea != nil {
-            stack.addArrangedSubview(separator())
-            stack.addArrangedSubview(makeRow(
-                title: "Clear",
-                isSelected: false,
-                destructive: true,
-                identifier: CatchDevReporterAccessibility.areaClear
-            ) { [weak self] in self?.pick(nil) })
+        let done = barButton(title: "Done", id: CatchDevReporterAccessibility.areaDone) { [weak self] in
+            guard let self else { return }
+            // Row 0 is None -> clear the area.
+            self.onPick(self.selectedRow == 0 ? nil : self.rows[self.selectedRow])
+            self.dismiss(animated: true)
         }
+        done.setTitleColor(ReporterTheme.text, for: .normal)
+        done.titleLabel?.font = .systemFont(ofSize: 16, weight: .semibold)
 
-        view.addSubview(stack)
+        let title = UILabel()
+        title.text = "Area"
+        title.font = .systemFont(ofSize: 16, weight: .semibold)
+        title.textColor = ReporterTheme.text
+        title.textAlignment = .center
+
+        let bar = UIStackView(arrangedSubviews: [cancel, title, done])
+        bar.axis = .horizontal
+        bar.alignment = .center
+        bar.distribution = .equalCentering
+        bar.isLayoutMarginsRelativeArrangement = true
+        bar.layoutMargins = UIEdgeInsets(top: 0, left: 16, bottom: 0, right: 16)
+        bar.heightAnchor.constraint(equalToConstant: barHeight).isActive = true
+
+        let separator = UIView()
+        separator.backgroundColor = ReporterTheme.borderSoft
+        separator.heightAnchor.constraint(equalToConstant: 1).isActive = true
+
+        picker.dataSource = self
+        picker.delegate = self
+        picker.accessibilityIdentifier = CatchDevReporterAccessibility.areaWheel
+        picker.selectRow(selectedRow, inComponent: 0, animated: false)
+        picker.heightAnchor.constraint(equalToConstant: wheelHeight).isActive = true
+
+        let column = UIStackView(arrangedSubviews: [bar, separator, picker])
+        column.axis = .vertical
+        column.translatesAutoresizingMaskIntoConstraints = false
+        view.addSubview(column)
         NSLayoutConstraint.activate([
-            stack.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor),
-            stack.leadingAnchor.constraint(equalTo: view.leadingAnchor),
-            stack.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            column.topAnchor.constraint(equalTo: view.topAnchor),
+            column.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            column.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            column.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor),
         ])
+    }
+
+    /// Sheet height: the bar + the wheel + the home-indicator inset, so it hugs its content
+    /// instead of sitting at a half-screen detent with dead space below.
+    private var contentHeight: CGFloat {
+        barHeight + 1 + wheelHeight + bottomInset
     }
 
     private func configureSheet() {
@@ -90,7 +111,6 @@ final class AreaPickerSheetViewController: UIViewController {
         sheet.prefersGrabberVisible = true
         sheet.preferredCornerRadius = 20
         if #available(iOS 16.0, *) {
-            // Size the sheet to its rows. Pre-16 falls back to the medium detent.
             sheet.detents = [.custom(identifier: .init("cdv.area")) { [weak self] _ in
                 self?.contentHeight
             }]
@@ -99,62 +119,41 @@ final class AreaPickerSheetViewController: UIViewController {
         }
     }
 
-    private func pick(_ area: String?) {
-        onPick(area)
-        dismiss(animated: true)
-    }
-
-    /// A row is a plain `UIButton` hosting a leading label and a trailing checkmark.
-    /// `UIButton.Configuration` centres its title when there is no image, which reads
-    /// wrong in a list, so the content is laid out explicitly instead.
-    private func makeRow(
-        title: String,
-        isSelected: Bool,
-        destructive: Bool,
-        identifier: String,
-        action: @escaping () -> Void
-    ) -> UIButton {
+    private func barButton(title: String, id: String, action: @escaping () -> Void) -> UIButton {
         let button = UIButton(type: .system)
-        button.accessibilityIdentifier = identifier
-        button.accessibilityLabel = title
-        button.heightAnchor.constraint(equalToConstant: rowHeight).isActive = true
-
-        let label = UILabel()
-        label.text = title
-        label.font = .systemFont(ofSize: 16)
-        label.textColor = destructive ? .systemRed : ReporterTheme.text
-
-        let check = UIImageView(
-            image: ReporterStyle.symbolImage("checkmark", pointSize: 14, weight: .semibold)?
-                .withTintColor(ReporterTheme.text, renderingMode: .alwaysOriginal)
-        )
-        check.isHidden = !isSelected
-        check.setContentHuggingPriority(.required, for: .horizontal)
-
-        let row = UIStackView(arrangedSubviews: [label, UIView(), check])
-        row.axis = .horizontal
-        row.alignment = .center
-        row.spacing = 8
-        // Let taps fall through to the button.
-        row.isUserInteractionEnabled = false
-        row.translatesAutoresizingMaskIntoConstraints = false
-        button.addSubview(row)
-        NSLayoutConstraint.activate([
-            row.leadingAnchor.constraint(equalTo: button.leadingAnchor, constant: 20),
-            row.trailingAnchor.constraint(equalTo: button.trailingAnchor, constant: -20),
-            row.topAnchor.constraint(equalTo: button.topAnchor),
-            row.bottomAnchor.constraint(equalTo: button.bottomAnchor),
-        ])
-
+        button.setTitle(title, for: .normal)
+        button.titleLabel?.font = .systemFont(ofSize: 16)
+        button.accessibilityIdentifier = id
         button.addAction(UIAction { _ in action() }, for: .touchUpInside)
         return button
     }
+}
 
-    private func separator() -> UIView {
-        let line = UIView()
-        line.backgroundColor = ReporterTheme.borderSoft
-        line.heightAnchor.constraint(equalToConstant: 1).isActive = true
-        return line
+extension AreaPickerSheetViewController: UIPickerViewDataSource, UIPickerViewDelegate {
+    func numberOfComponents(in pickerView: UIPickerView) -> Int { 1 }
+
+    func pickerView(_ pickerView: UIPickerView, numberOfRowsInComponent component: Int) -> Int {
+        rows.count
+    }
+
+    func pickerView(
+        _ pickerView: UIPickerView,
+        attributedTitleForRow row: Int,
+        forComponent component: Int
+    ) -> NSAttributedString? {
+        // Themed rather than plain `titleForRow`, so the wheel follows the reporter's palette
+        // in dark mode instead of defaulting to the system label colour.
+        NSAttributedString(
+            string: rows[row],
+            attributes: [
+                .foregroundColor: row == 0 ? ReporterTheme.textMuted : ReporterTheme.text,
+                .font: UIFont.systemFont(ofSize: 20),
+            ]
+        )
+    }
+
+    func pickerView(_ pickerView: UIPickerView, didSelectRow row: Int, inComponent component: Int) {
+        selectedRow = row
     }
 }
 #endif

@@ -40,6 +40,10 @@ final class ReporterViewController: UIViewController {
     // Snapshot the global toggle once per presentation so `buildBody` (shows the field) and
     // `send` (reads it) always agree, even if a host flips the flag while the reporter is up.
     private let contactFieldEnabled = CatchDev.isContactFieldEnabled
+    // Snapshotted for the same reason: `buildBody` decides whether the Area field exists, and
+    // `presentAreaPicker` fills the wheel. A host mutating the list mid-presentation must not
+    // leave a field whose picker has nothing in it.
+    private let areas = CatchDev.areas
 
     // Views
     private let scrollView = UIScrollView()
@@ -189,7 +193,10 @@ final class ReporterViewController: UIViewController {
         contentStack.addArrangedSubview(makeDescriptionSection())
         severitySection = makeSeveritySection()
         contentStack.addArrangedSubview(severitySection)
-        contentStack.addArrangedSubview(makeAreaSection())
+        // A host that supplies no areas gets no Area field — an empty picker is worse than none.
+        if !areas.isEmpty {
+            contentStack.addArrangedSubview(makeAreaSection())
+        }
         contentStack.addArrangedSubview(makeAttachmentsSection())
         if contactFieldEnabled {
             contentStack.addArrangedSubview(makeContactSection())
@@ -370,8 +377,9 @@ final class ReporterViewController: UIViewController {
     private func presentAreaPicker() {
         descriptionTextView.resignFirstResponder()
         let picker = AreaPickerSheetViewController(
-            areas: AreaDropdownView.areas,
-            selected: areaDropdown.selected
+            areas: areas,
+            selected: areaDropdown.selected,
+            bottomInset: view.safeAreaInsets.bottom
         ) { [weak self] area in
             self?.areaDropdown.choose(area)
         }

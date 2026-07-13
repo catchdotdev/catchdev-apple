@@ -90,6 +90,12 @@ CatchDev.setUser(id:email:)             // attach an end-user identity
 CatchDev.setMetadata(["screen": "Cart"])// arbitrary custom key/values
 CatchDev.setEnvironment("production")   // tag reports with an environment
 CatchDev.isShakeToReportEnabled = false // disable the shake trigger
+
+// The areas offered by the reporter's "Area" picker. Defaults to
+// CatchDev.defaultAreas (Login / Payments / Performance / Other). The picker is a
+// scrolling wheel, so a long list is fine. Area stays optional — the wheel has a
+// "None" row. Set an empty array to hide the Area field entirely.
+CatchDev.areas = ["Checkout", "Search", "Profile", "Notifications", "Billing"]
 CatchDev.presentReporter()              // open the reporter manually (e.g. a button)
 CatchDev.isDebugLoggingEnabled = true   // print SDK diagnostics while integrating
 

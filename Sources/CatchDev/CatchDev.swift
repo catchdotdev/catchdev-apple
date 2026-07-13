@@ -77,6 +77,7 @@ public final class CatchDev: NSObject {
     private var user: FeedbackUser?
     private var metadata: [String: String] = [:]
     private var environment: String?
+    private var areas: [String] = CatchDev.defaultAreas
     private var breadcrumbs = BreadcrumbTrail(capacity: CatchDev.breadcrumbCapacity)
     private var breadcrumbsEnabled = true
     private var networkCaptureEnabled = false
@@ -190,6 +191,22 @@ public final class CatchDev: NSObject {
             #endif
         }
     }
+
+    /// The areas offered by the reporter's **Area** picker, in the order shown.
+    ///
+    /// Defaults to ``defaultAreas``. Set your own to match how your app is actually divided
+    /// (`["Checkout", "Search", "Profile", …]`); the picker scrolls, so a long list is fine.
+    /// Set an **empty array** to hide the Area field entirely.
+    ///
+    /// Area stays optional either way — the picker offers a "None" row.
+    @objc public static var areas: [String] {
+        get { shared.withLock { $0.areas } }
+        // Blank entries would render as an unpickable empty row.
+        set { shared.withLock { $0.areas = newValue.filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty } } }
+    }
+
+    /// The built-in area list used when the host doesn't set its own.
+    @objc public static let defaultAreas = ["Login", "Payments", "Performance", "Other"]
 
     /// Whether the reporter shows the **Contact email** field. Defaults to `false` — most
     /// apps identify the user via ``setUser(id:email:)`` / ``setUserEmail(_:)`` instead of

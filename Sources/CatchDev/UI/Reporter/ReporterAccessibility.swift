@@ -21,12 +21,12 @@ public enum CatchDevReporterAccessibility {
         "catchdev.reporter.severity.\(value.rawValue)"
     }
 
-    // Area dropdown
+    // Area picker. The options live on a UIPickerView wheel, which has no per-row elements —
+    // UI tests drive it with `pickerWheels.adjust(toPickerWheelValue:)` and commit with Done.
     public static let area = "catchdev.reporter.area"
-    public static let areaClear = "catchdev.reporter.area.clear"
-    public static func areaOption(_ name: String) -> String {
-        "catchdev.reporter.area.\(name.lowercased())"
-    }
+    public static let areaWheel = "catchdev.reporter.area.wheel"
+    public static let areaDone = "catchdev.reporter.area.done"
+    public static let areaCancel = "catchdev.reporter.area.cancel"
 
     // Tools
     public static let toolScreenshot = "catchdev.reporter.tool.screenshot"
