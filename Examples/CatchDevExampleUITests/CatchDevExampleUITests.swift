@@ -160,6 +160,22 @@ final class CatchDevExampleUITests: XCTestCase {
         XCTAssertTrue(message.waitForExistence(timeout: 3), "Should return to the form after Done")
     }
 
+    /// The pencil on the thumbnail is the way to mark up a screenshot that is ALREADY attached
+    /// (the Screenshot tool button re-annotates the primary one). Nothing covered this before.
+    func testEditButtonOnThumbnailOpensAnnotate() {
+        let app = launchApp()
+        let message = openReporter(app)
+
+        let edit = app.buttons["catchdev.reporter.attachment.edit.0"]
+        XCTAssertTrue(edit.waitForExistence(timeout: 3), "The attached screenshot should offer an edit button")
+        edit.tap()
+
+        let done = app.buttons["catchdev.reporter.annotate.done"]
+        XCTAssertTrue(done.waitForExistence(timeout: 3), "Edit should open the annotate screen")
+        done.tap()
+        XCTAssertTrue(message.waitForExistence(timeout: 3), "Should return to the form after Done")
+    }
+
     func testRecordReopensReporterWithRecordingAttachment() {
         let app = launchApp()
         let message = openReporter(app)

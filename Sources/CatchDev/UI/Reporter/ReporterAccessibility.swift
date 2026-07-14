@@ -41,6 +41,10 @@ public enum CatchDevReporterAccessibility {
     public static func attachmentRemove(_ index: Int) -> String {
         "catchdev.reporter.attachment.remove.\(index)"
     }
+    /// Opens the annotate screen for an existing screenshot attachment.
+    public static func attachmentEdit(_ index: Int) -> String {
+        "catchdev.reporter.attachment.edit.\(index)"
+    }
 
     // Diagnostics disclosure
     public static let diagnosticsHeader = "catchdev.reporter.diagnostics"

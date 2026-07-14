@@ -128,15 +128,29 @@ final class AttachmentsView: UIView {
             imageView.translatesAutoresizingMaskIntoConstraints = false
             card.addSubview(imageView)
             pin(imageView, to: card)
-            let badge = makeBadge(
-                title: attachment.annotated ? "Annotated" : "Annotate",
-                symbol: "pencil"
+
+            // Mark up an existing screenshot. Mirrors the remove button in the opposite corner,
+            // so both actions on a thumbnail are where the eye already looks.
+            let edit = makeCornerButton(
+                symbol: "pencil",
+                identifier: CatchDevReporterAccessibility.attachmentEdit(index),
+                label: "Annotate screenshot"
             ) { [weak self] in self?.onAnnotate?(attachment.id) }
-            card.addSubview(badge)
+            card.addSubview(edit)
             NSLayoutConstraint.activate([
-                badge.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 5),
-                badge.bottomAnchor.constraint(equalTo: card.bottomAnchor, constant: -5),
+                edit.topAnchor.constraint(equalTo: card.topAnchor, constant: 5),
+                edit.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 5),
             ])
+
+            // State only — the pencil above is the action.
+            if attachment.annotated {
+                let badge = makeBadge(title: "Annotated", symbol: "checkmark", action: nil)
+                card.addSubview(badge)
+                NSLayoutConstraint.activate([
+                    badge.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 5),
+                    badge.bottomAnchor.constraint(equalTo: card.bottomAnchor, constant: -5),
+                ])
+            }
         case .recording:
             card.backgroundColor = UIColor(white: 0.1, alpha: 1)
             let play = UIImageView(image: ReporterStyle.symbolImage("play.fill", pointSize: 16))
@@ -182,26 +196,49 @@ final class AttachmentsView: UIView {
             ])
         }
 
-        let remove = UIButton(type: .system)
-        remove.setImage(ReporterStyle.symbolImage("xmark", pointSize: 9, weight: .bold), for: .normal)
-        remove.tintColor = .white
-        remove.backgroundColor = UIColor(white: 0, alpha: 0.7)
-        remove.layer.cornerRadius = 10
-        remove.translatesAutoresizingMaskIntoConstraints = false
-        remove.accessibilityIdentifier = CatchDevReporterAccessibility.attachmentRemove(index)
-        remove.addAction(UIAction { [weak self] _ in self?.onRemove?(attachment.id) }, for: .touchUpInside)
+        let remove = makeCornerButton(
+            symbol: "xmark",
+            identifier: CatchDevReporterAccessibility.attachmentRemove(index),
+            label: "Remove attachment"
+        ) { [weak self] in self?.onRemove?(attachment.id) }
         card.addSubview(remove)
         NSLayoutConstraint.activate([
-            remove.widthAnchor.constraint(equalToConstant: 20),
-            remove.heightAnchor.constraint(equalToConstant: 20),
             remove.topAnchor.constraint(equalTo: card.topAnchor, constant: 5),
             remove.trailingAnchor.constraint(equalTo: card.trailingAnchor, constant: -5),
         ])
         return card
     }
 
+    /// A 20pt circular action pinned to a thumbnail's corner (annotate, remove).
+    private func makeCornerButton(
+        symbol: String,
+        identifier: String,
+        label: String,
+        action: @escaping () -> Void
+    ) -> UIButton {
+        let button = UIButton(type: .system)
+        button.setImage(ReporterStyle.symbolImage(symbol, pointSize: 9, weight: .bold), for: .normal)
+        button.tintColor = .white
+        button.backgroundColor = UIColor(white: 0, alpha: 0.7)
+        button.layer.cornerRadius = 10
+        button.clipsToBounds = true
+        button.translatesAutoresizingMaskIntoConstraints = false
+        button.accessibilityIdentifier = identifier
+        button.accessibilityLabel = label
+        button.addAction(UIAction { _ in action() }, for: .touchUpInside)
+        NSLayoutConstraint.activate([
+            button.widthAnchor.constraint(equalToConstant: 20),
+            button.heightAnchor.constraint(equalToConstant: 20),
+        ])
+        return button
+    }
+
     private func makeBadge(title: String, symbol: String, action: (() -> Void)?) -> UIView {
         let button = UIButton(type: .system)
+        // Callers pin this with Auto Layout. Without this the autoresizing-mask constraints
+        // fight those, UIKit resolves the conflict by collapsing the badge to zero size, and it
+        // silently never renders — which is exactly what happened to the Annotate/Video badges.
+        button.translatesAutoresizingMaskIntoConstraints = false
         var config = UIButton.Configuration.plain()
         config.title = title
         config.image = ReporterStyle.symbolImage(symbol, pointSize: 9)
