@@ -93,10 +93,15 @@ final class AreaPickerSheetViewController: UIViewController {
         column.translatesAutoresizingMaskIntoConstraints = false
         view.addSubview(column)
         NSLayoutConstraint.activate([
-            column.topAnchor.constraint(equalTo: view.topAnchor),
             column.leadingAnchor.constraint(equalTo: view.leadingAnchor),
             column.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            // The column is its own height: the bar (52) + separator (1) + the wheel (216) are
+            // all required, fixed heights. Pinning BOTH edges as well over-determines it, and
+            // that is unsatisfiable at any sheet height other than the exact custom detent —
+            // i.e. on iOS 15, where the detent falls back to `.medium()`, and on iPad. Anchor
+            // the content to the bottom (where a picker belongs) and let the top float.
             column.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor),
+            column.topAnchor.constraint(greaterThanOrEqualTo: view.topAnchor),
         ])
     }
 
@@ -126,6 +131,19 @@ final class AreaPickerSheetViewController: UIViewController {
         button.accessibilityIdentifier = id
         button.addAction(UIAction { _ in action() }, for: .touchUpInside)
         return button
+    }
+}
+
+/// Test seam for the app-hosted layout tests. The package's own `swift test` target is
+/// Foundation-only (macOS) and cannot see UIKit, so the sheet's Auto Layout — which is
+/// over-determined the moment its content column is pinned to both edges — is only reachable
+/// from the example app's unit tests.
+@_spi(CatchDevTesting)
+public enum CatchDevAreaPickerTesting {
+    public static func make(areas: [String], selected: String?, bottomInset: CGFloat) -> UIViewController {
+        AreaPickerSheetViewController(
+            areas: areas, selected: selected, bottomInset: bottomInset, onPick: { _ in }
+        )
     }
 }
 

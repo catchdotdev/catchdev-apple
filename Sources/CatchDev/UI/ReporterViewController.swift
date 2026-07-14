@@ -120,6 +120,37 @@ final class ReporterViewController: UIViewController {
         }
     }
 
+    /// Borders are `CGColor` snapshots of dynamic colours (see ``UIView/cdvSetBorder(_:width:)``),
+    /// so they are the one thing that does NOT follow a light↔dark switch made while the
+    /// reporter is open. Re-resolve them; every other colour updates itself.
+    ///
+    /// Resolved against **this view controller's** traits, never the subviews' own: when this
+    /// callback fires, UIKit has updated the VC's `traitCollection` but not yet the view subtree's
+    /// (they still report the appearance the user just left), so a per-view refresh writes the
+    /// stale colour straight back — see ``UIView/cdvRefreshBorders(with:)``.
+    override func traitCollectionDidChange(_ previous: UITraitCollection?) {
+        super.traitCollectionDidChange(previous)
+        guard traitCollection.hasDifferentColorAppearance(comparedTo: previous) else { return }
+        view.cdvRefreshBorders(with: traitCollection)
+        // Belt and braces: resolve once more after the current run-loop turn, when EVERY trait
+        // environment in the hierarchy has settled on the new appearance. It makes the refresh
+        // independent of who UIKit updates first (the pass above assumes the VC — which is what
+        // it observably does), and it is ~30 layer writes with nothing else to do.
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.view.cdvRefreshBorders(with: self.traitCollection)
+        }
+    }
+
+    /// The reporter can be built (and its borders first resolved) before it is in a window — and
+    /// a detached view inherits whatever traits happened to be current, not the window's. Resolve
+    /// them once more now that the hierarchy is real, so a reporter opened in dark mode never
+    /// shows a light border.
+    override func viewWillAppear(_ animated: Bool) {
+        super.viewWillAppear(animated)
+        view.cdvRefreshBorders(with: traitCollection)
+    }
+
     // MARK: - Build UI
 
     private func buildTopBar() {
@@ -207,8 +238,7 @@ final class ReporterViewController: UIViewController {
         let box = UIView()
         box.backgroundColor = ReporterTheme.fieldBg
         box.layer.cornerRadius = 13
-        box.layer.borderWidth = 1
-        box.layer.borderColor = ReporterTheme.border.cgColor
+        box.cdvSetBorder(ReporterTheme.border)
 
         descriptionTextView.backgroundColor = .clear
         descriptionTextView.font = .systemFont(ofSize: 16)
@@ -283,8 +313,7 @@ final class ReporterViewController: UIViewController {
         contactField.textColor = ReporterTheme.text
         contactField.backgroundColor = ReporterTheme.fieldBg
         contactField.layer.cornerRadius = 12
-        contactField.layer.borderWidth = 1
-        contactField.layer.borderColor = ReporterTheme.border.cgColor
+        contactField.cdvSetBorder(ReporterTheme.border)
         contactField.keyboardType = .emailAddress
         contactField.autocapitalizationType = .none
         contactField.autocorrectionType = .no
@@ -469,29 +498,63 @@ final class ReporterViewController: UIViewController {
         ])
         showOverlay(overlay)
 
-        CatchDev.shared.submit(
-            message: message,
-            imageData: nil,
+        // `submit` persists the report and every attachment's bytes to disk SYNCHRONOUSLY, on the
+        // thread that calls it, before it returns — that is what makes a submission survive the
+        // process dying (see the persist comment in `CatchDev.submit`). A screen recording is
+        // 25–40 MB, so that write must not happen on the main thread: run it on a background
+        // queue and come back to main for the UI. The reporter's "Sending report…" overlay is
+        // already up, so there is nothing for the user to interact with while it lands.
+        //
+        // Mirrors the Android reporter, which submits on its `uploadExecutor` for the same reason.
+        let submitState = (
             type: reportType,
             severity: reportType == .bug ? severity : nil,
             area: area,
-            contactEmail: contact,
-            pendingAttachments: pending,
-            reportId: reportId,
             screenName: screenName,
-            excludedDiagnostics: excluded
-        ) { [weak self] result in
-            DispatchQueue.main.async {
-                guard let self else { return }
-                switch result {
-                case .success(.delivered(let id)):
-                    self.showSuccess(reportId: id.isEmpty ? self.reportId : id, queued: false)
-                case .success(.queued(let id)):
-                    // Durably saved, just not sent yet — a success, not an error.
-                    self.showSuccess(reportId: id, queued: true)
-                case .failure(let error):
-                    self.hideOverlay()
-                    self.presentError(error)
+            excluded: excluded,
+            reportId: reportId
+        )
+        // Backgrounding the app the instant you tap Send (home gesture, an incoming call) is an
+        // ordinary thing to do, and iOS will suspend — later jetsam — the process part-way through
+        // the write. Hold an assertion across it so the entry lands whole. Taken here, on the main
+        // thread, because that is where UIApplication may be touched.
+        var assertion: UIBackgroundTaskIdentifier = .invalid
+        let endAssertion = {
+            guard assertion != .invalid else { return }
+            UIApplication.shared.endBackgroundTask(assertion)
+            assertion = .invalid
+        }
+        assertion = UIApplication.shared.beginBackgroundTask(withName: "dev.catch.send") {
+            // Expired: iOS wants the time back. Must end it or the host app is killed.
+            DispatchQueue.main.async(execute: endAssertion)
+        }
+
+        DispatchQueue.global(qos: .userInitiated).async {
+            CatchDev.shared.submit(
+                message: message,
+                imageData: nil,
+                type: submitState.type,
+                severity: submitState.severity,
+                area: submitState.area,
+                contactEmail: contact,
+                pendingAttachments: pending,
+                reportId: submitState.reportId,
+                screenName: submitState.screenName,
+                excludedDiagnostics: submitState.excluded
+            ) { [weak self] result in
+                DispatchQueue.main.async {
+                    endAssertion()
+                    guard let self else { return }
+                    switch result {
+                    case .success(.delivered(let id)):
+                        self.showSuccess(reportId: id.isEmpty ? self.reportId : id, queued: false)
+                    case .success(.queued(let id)):
+                        // Durably saved, just not sent yet — a success, not an error.
+                        self.showSuccess(reportId: id, queued: true)
+                    case .failure(let error):
+                        self.hideOverlay()
+                        self.presentError(error)
+                    }
                 }
             }
         }

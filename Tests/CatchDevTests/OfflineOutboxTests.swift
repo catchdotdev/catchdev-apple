@@ -81,6 +81,41 @@ final class OfflineOutboxTests: XCTestCase {
 
     // MARK: - 1. Persist first / offline is not an error
 
+    /// **Persist first means persist SYNCHRONOUSLY.** Tapping Send and immediately backgrounding
+    /// the app is an ordinary gesture (home swipe, an incoming call, an app switch) and iOS then
+    /// suspends — and later jetsams — the process without running whatever the SDK merely
+    /// *scheduled*. A `submit` that hands its `enqueue` to a background queue therefore loses the
+    /// report, the typed message and the 30 MB recording outright, while the user is looking at
+    /// "Sending report…" and believing it was sent.
+    ///
+    /// So: by the time `submit` RETURNS — with no waiting, no run-loop turn, nothing draining —
+    /// the report and every attachment byte must already be on disk.
+    func testSubmitPersistsTheReportAndItsBytesBeforeItEvenReturns() throws {
+        let outbox = tempOutbox()
+        let sdk = makeSDK(outbox: outbox)
+        stub.offline = true
+
+        sdk.submit(
+            message: "typed just before the app was suspended",
+            imageData: nil,
+            pendingAttachments: [screenshotBlob(128)],
+            reportId: "durable"
+        ) { _ in }
+
+        // Not a single `wait` above this line: this is the state of the disk the instant Send
+        // returned, which is all a process that gets suspended right afterwards will ever have.
+        XCTAssertEqual(outbox.count, 1, "the entry must be on disk before submit returns")
+        let entry = try XCTUnwrap(outbox.entry(reportId: "durable"))
+        XCTAssertEqual(entry.report.message, "typed just before the app was suspended")
+        XCTAssertEqual(
+            outbox.blobData(reportId: "durable", index: 0)?.count, 128,
+            "the attachment's raw bytes are persisted too — before any network call"
+        )
+
+        settle() // let the (offline) delivery attempt finish before the stub is torn down
+        XCTAssertEqual(outbox.count, 1, "still queued: it was never delivered")
+    }
+
     func testOfflineSubmitPersistsReportWithBlobsAndReportsQueuedNotAnError() throws {
         let outbox = tempOutbox()
         let sdk = makeSDK(outbox: outbox)
@@ -320,7 +355,7 @@ final class OfflineOutboxTests: XCTestCase {
 
         // Fire a flush from inside the R2 PUT — i.e. while submit's upload is genuinely in
         // flight, the entry is on disk, and its blob bytes have not been dropped yet.
-        stub.flushOnFirstPut = { [weak sdk] in sdk?.flushPending() }
+        stub.onFirstPut = { [weak sdk] in sdk?.flushPending() }
 
         let outcome = try submit(sdk, blobs: [screenshotBlob()])
         guard case .delivered = outcome else { return XCTFail("expected delivered, got \(outcome)") }
@@ -360,7 +395,7 @@ final class OfflineOutboxTests: XCTestCase {
             _ = deliveries.increment()
             delivered.fulfill()
         }
-        stub.flushOnFirstPut = { [weak sdk] in sdk?.flushPending() }
+        stub.onFirstPut = { [weak sdk] in sdk?.flushPending() }
 
         let second = try submit(sdk, message: "newer report", blobs: [screenshotBlob(64)])
         guard case .delivered = second else { return XCTFail("expected delivered, got \(second)") }
@@ -380,6 +415,47 @@ final class OfflineOutboxTests: XCTestCase {
         }
         XCTAssertEqual(stub.putCount, 2, "each attachment reaches R2 exactly once")
         XCTAssertEqual(outbox.count, 0)
+    }
+
+    // MARK: - 8. The caps must never evict an entry that is being delivered
+
+    /// B1, end to end. The delivery claim lives inside the outbox so the CAPS can see it.
+    ///
+    /// A report with TWO attachments is being delivered; while its FIRST blob is mid-PUT — so
+    /// the second one's bytes have not been read yet — another report is queued and trips the
+    /// count cap. The eviction used to delete the folder of the entry being delivered: the
+    /// deliverer then found blob #2's bytes gone, read that as "already uploaded", POSTed the
+    /// report WITHOUT that attachment, and the backend's 2xx ack made the loss permanent.
+    ///
+    /// Both halves of the fix are asserted here: the entry is not evicted (so the bytes are
+    /// still there), and missing bytes with no receipt are no longer mistaken for an upload.
+    func testACapEvictionCannotStripAnInFlightReportOfItsEvidence() throws {
+        let outbox = tempOutbox(maxEntries: 1)
+        let sdk = makeSDK(outbox: outbox)
+
+        // Queue a second report from inside the first R2 PUT — synchronously, so the cap runs
+        // while the delivery is genuinely mid-flight and blob #2 is still only on disk.
+        stub.onFirstPut = {
+            var later = FeedbackReport(message: "queued behind it")
+            later.reportId = "later"
+            later.time = "2099-01-01T00:00:00Z"
+            try? outbox.enqueue(later)
+        }
+
+        let outcome = try submit(sdk, message: "two files", blobs: [screenshotBlob(64), recordingBlob(128)])
+        guard case .delivered = outcome else {
+            return XCTFail("the in-flight entry was evicted from under its delivery, got \(outcome)")
+        }
+        settle()
+
+        XCTAssertEqual(stub.putCount, 2, "BOTH attachments reached R2 — the second one's bytes survived")
+        let body = try XCTUnwrap(stub.reportBodies.first)
+        XCTAssertEqual(
+            try Self.attachmentCount(in: body), 2,
+            "an entry being delivered must not be evicted — the delivered report keeps every attachment"
+        )
+        XCTAssertEqual(outbox.count, 1, "the delivered entry is gone; the one queued behind it stays")
+        XCTAssertEqual(outbox.pendingReportIds(), ["later"])
     }
 
     // MARK: - Helpers
@@ -422,7 +498,7 @@ private final class StubbedBackend {
     private var _mintCount = 0
     private var _putCount = 0
     private var _reportBodies: [String] = []
-    private var _flushOnFirstPut: (() -> Void)?
+    private var _onFirstPut: (() -> Void)?
 
     var offline: Bool {
         get { lock.lock(); defer { lock.unlock() }; return _offline }
@@ -437,9 +513,9 @@ private final class StubbedBackend {
     /// Run once, from inside the first R2 PUT — i.e. while a submit's upload is genuinely in
     /// flight. Lets a test fire a flush at the exact moment the racing triggers do (reconnect,
     /// foreground) with the entry sitting on disk, un-acked, bytes not yet dropped.
-    var flushOnFirstPut: (() -> Void)? {
-        get { lock.lock(); defer { lock.unlock() }; return _flushOnFirstPut }
-        set { lock.lock(); defer { lock.unlock() }; _flushOnFirstPut = newValue }
+    var onFirstPut: (() -> Void)? {
+        get { lock.lock(); defer { lock.unlock() }; return _onFirstPut }
+        set { lock.lock(); defer { lock.unlock() }; _onFirstPut = newValue }
     }
     /// Fail only the report POST at the transport layer (uploads still succeed).
     var reportTransportFails: Bool {
@@ -501,8 +577,8 @@ private final class StubbedBackend {
     /// Take the one-shot PUT hook, so a flush it triggers can't re-trigger itself.
     private func claimFlushHook() -> (() -> Void)? {
         lock.lock(); defer { lock.unlock() }
-        let hook = _flushOnFirstPut
-        _flushOnFirstPut = nil
+        let hook = _onFirstPut
+        _onFirstPut = nil
         return hook
     }
 

@@ -66,8 +66,7 @@ final class SendingOverlayView: UIView {
     private func makeStepRow(_ text: String) -> UIView {
         let dot = UIView()
         dot.layer.cornerRadius = 8
-        dot.layer.borderWidth = 1.5
-        dot.layer.borderColor = ReporterTheme.border.cgColor
+        dot.cdvSetBorder(ReporterTheme.border, width: 1.5)
         dot.translatesAutoresizingMaskIntoConstraints = false
         dot.widthAnchor.constraint(equalToConstant: 16).isActive = true
         dot.heightAnchor.constraint(equalToConstant: 16).isActive = true
@@ -103,7 +102,7 @@ final class SendingOverlayView: UIView {
             let row = self.stepRows[index]
             UIView.animate(withDuration: 0.2) {
                 row.dot.backgroundColor = ReporterTheme.bugAccent
-                row.dot.layer.borderColor = ReporterTheme.bugAccent.cgColor
+                row.dot.cdvSetBorder(ReporterTheme.bugAccent, width: 1.5)
                 row.check.isHidden = false
                 row.label.alpha = 1
                 row.label.textColor = ReporterTheme.textSoft

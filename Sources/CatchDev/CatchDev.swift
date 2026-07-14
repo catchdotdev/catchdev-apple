@@ -73,6 +73,31 @@ public final class CatchDev: NSObject {
     /// Whether to watch connectivity and auto-flush on reconnect (off in unit tests).
     private let reachabilityEnabled: Bool
 
+    /// Serial queue for the SDK's own outbox work: the whole flush drain, and every read/write a
+    /// delivery makes (reading a blob's 25–40 MB back off disk, recording an upload's receipt,
+    /// ack-deleting the entry).
+    ///
+    /// **Its real job is to keep that work off the HOST's threads.** A `URLSession` completion
+    /// runs on the session's delegate queue — in production `URLSession.shared`, whose threads the
+    /// host app also uses — so continuing a delivery inline from a network callback would do the
+    /// SDK's disk IO (and take the outbox's lock) on a thread the host is relying on. Every hop
+    /// out of a network callback therefore lands back here first; `deliver`/`uploadBlobs` are
+    /// written that way.
+    ///
+    /// The one thing that deliberately does NOT run here is ``submit``'s initial `enqueue`: it is
+    /// synchronous on the caller's thread, because a submission scheduled but not yet written
+    /// dies with a process that gets suspended right after Send (see `submit`).
+    private let outboxQueue = DispatchQueue(label: "dev.catch.outbox", qos: .utility)
+
+    /// Where `didBecomeActive` is observed. Explicitly NOT the main queue: the foreground
+    /// flush touches the outbox, and `queue: nil` would run it on the posting (main) thread.
+    private let notificationQueue: OperationQueue = {
+        let queue = OperationQueue()
+        queue.maxConcurrentOperationCount = 1
+        queue.qualityOfService = .utility
+        return queue
+    }()
+
     private var configuration: Configuration?
     private var user: FeedbackUser?
     private var metadata: [String: String] = [:]
@@ -90,8 +115,6 @@ public final class CatchDev: NSObject {
     private var feedbackSentHandler: ((Result<String, Error>) -> Void)?
     private var debugLogging = false
     private var isFlushing = false
-    /// Report ids currently being delivered by *any* path. See ``beginDelivery(of:)``.
-    private var deliveringReportIds: Set<String> = []
     private var monitorStarted = false
     private var foregroundObserved = false
     private var pathMonitor: NWPathMonitor?
@@ -305,6 +328,12 @@ public final class CatchDev: NSObject {
     ///
     /// Offline, the completion reports `.queued` (a success-style state), not an error;
     /// `onFeedbackSent` fires only on actual delivery.
+    ///
+    /// **Threading.** The report is assembled AND persisted on the calling thread — see the
+    /// "persist first, synchronously" comment below for why the persist may not be deferred to a
+    /// queue — and everything after it (uploads, the report POST, and the outbox writes they
+    /// drive) runs on ``outboxQueue``. `completion` therefore lands on a background thread;
+    /// callers that drive UI from it must hop to main themselves (the reporter does).
     func submit(
         message: String,
         imageData: Data?,
@@ -363,79 +392,103 @@ public final class CatchDev: NSObject {
             report.osVersion = nil
         }
 
-        // 1. PERSIST FIRST — report + every attachment's bytes, before any network call.
-        var queuedDurably = false
-        if let outbox {
-            do { try outbox.enqueue(report, blobs: pendingAttachments); queuedDurably = true }
-            catch { log("outbox enqueue failed: \(error)") }
-        }
-        // Only a durably-persisted entry may be reported as "queued" (and kept on failure);
-        // if persistence failed we fall back to a best-effort in-memory send.
-        let durableOutbox = queuedDurably ? outbox : nil
         let reportId = report.reportId
 
-        // The entry is on disk from here until the ack, which makes it visible to every flush
-        // trigger (launch, reconnect, foreground). Claim it so no flush delivers it in
-        // parallel with us. If a flush already owns it, it is durable and in flight — say
-        // "queued" rather than sending the same report (and re-uploading its bytes) twice.
-        if durableOutbox != nil, !beginDelivery(of: reportId) {
-            log("submit: \(reportId) is already being delivered by a flush — queued")
-            completion(.success(.queued(reportId: reportId)))
-            return
-        }
-
-        // Deliver from the DURABLE entry, byte-for-byte the way a flush would: the report and
-        // the blob bytes are re-read from disk, so `markUploaded`'s "this blob landed" signal
-        // (its `.bin` is gone, its reference is in `report.json`) is observable here too. Only
-        // when there is no durable entry do we fall back to the in-memory bytes.
-        let deliveryReport: FeedbackReport
-        let blobs: [OutboxBlob]
-        let loadBlob: (OutboxBlob) -> Data?
-        if let durableOutbox, let entry = durableOutbox.entry(reportId: reportId) {
-            deliveryReport = entry.report
-            blobs = entry.blobs
-            loadBlob = { blob in durableOutbox.blobData(reportId: reportId, index: blob.index) }
-        } else {
-            deliveryReport = report
-            // Descriptors mirror what `enqueue` would have written (index = position).
-            blobs = pendingAttachments.enumerated().map { index, blob in
-                OutboxBlob(
-                    index: index, kind: blob.kind, contentType: blob.contentType,
-                    filename: blob.filename, annotated: blob.annotated, size: blob.data.count
-                )
+        // 1. PERSIST FIRST — report + every attachment's bytes, before any network call, and
+        // SYNCHRONOUSLY, on the caller's thread, before `submit` returns.
+        //
+        // The persist may NOT be moved onto `outboxQueue`. Tapping Send and immediately
+        // backgrounding the app (home gesture, an incoming call, an app switch) is an ordinary
+        // gesture, and iOS suspends — and later jetsams — a backgrounded process without running
+        // whatever was merely *scheduled*. A deferred enqueue therefore loses the report, the
+        // typed message and the recording outright, which is the exact loss the outbox exists to
+        // prevent. Blocking the caller for one file write (under the reporter's "Sending report…"
+        // overlay) is the price of "after submit returns, this submission survives the process
+        // dying". Everything after the persist — uploads, the POST, the outbox writes they drive —
+        // runs on `outboxQueue`.
+        //
+        // Claim the entry BEFORE `enqueue` publishes it. The claim lives in the OUTBOX, so it
+        // also stops the caps from evicting the entry we are about to upload. If a flush already
+        // owns it, it is durable and in flight — say "queued" rather than sending the same report
+        // (and re-uploading its bytes) twice.
+        var queuedDurably = false
+        var holding = false
+        if let outbox {
+            guard outbox.hold(reportId) else {
+                log("submit: \(reportId) is already being delivered by a flush — queued")
+                completion(.success(.queued(reportId: reportId)))
+                return
             }
-            loadBlob = { descriptor in
-                pendingAttachments.indices.contains(descriptor.index)
-                    ? pendingAttachments[descriptor.index].data
-                    : nil
+            do {
+                try outbox.enqueue(report, blobs: pendingAttachments)
+                queuedDurably = true
+                holding = true
+            } catch {
+                // Persistence failed (disk full): fall back to a best-effort in-memory send —
+                // and there is nothing on disk left to claim.
+                log("outbox enqueue failed: \(error)")
+                outbox.release(reportId)
             }
         }
+        // Only a durably-persisted entry may be reported as "queued" (and kept on failure).
+        let durableOutbox = queuedDurably ? outbox : nil
 
-        // 2/3. DELIVER, then ACK-then-delete (handled inside `deliver`).
-        deliver(
-            report: deliveryReport, blobs: blobs, loadBlob: loadBlob,
-            outbox: durableOutbox, configuration: configuration
-        ) { [weak self] result in
+        outboxQueue.async { [weak self] in
             guard let self else { return }
-            if durableOutbox != nil { self.endDelivery(of: reportId) }
-            switch result {
-            case .success(let id):
-                self.notifyFeedbackSent(.success(id))
-                completion(.success(.delivered(reportId: id)))
-            case .failure(.permanent(let error)):
-                // 4. The server rejected it for good; the entry is already dropped.
-                self.notifyFeedbackSent(.failure(error))
-                completion(.failure(error))
-            case .failure(.retryable(let error)):
-                // 5. Offline: the entry stays on disk and is delivered on reconnect. Report
-                // it QUEUED (a success state) so the reporter dismisses normally instead of
-                // showing "Couldn't send report"; onFeedbackSent fires when it lands.
-                if queuedDurably {
-                    self.log("submit deferred (offline) — queued \(reportId)")
-                    completion(.success(.queued(reportId: reportId)))
-                } else {
+
+            // Deliver from the DURABLE entry, byte-for-byte the way a flush would: the report
+            // and the blob bytes are re-read from disk, so the receipts `markUploaded` writes
+            // ("this blob landed") are observable here too. Only when there is no durable entry
+            // do we fall back to the in-memory bytes.
+            let deliveryReport: FeedbackReport
+            let blobs: [OutboxBlob]
+            let loadBlob: (OutboxBlob) -> Data?
+            if let durableOutbox, let entry = durableOutbox.entry(reportId: reportId) {
+                deliveryReport = entry.report
+                blobs = entry.blobs
+                loadBlob = { blob in durableOutbox.blobData(reportId: reportId, index: blob.index) }
+            } else {
+                deliveryReport = report
+                // Descriptors mirror what `enqueue` would have written (index = position).
+                blobs = pendingAttachments.enumerated().map { index, blob in
+                    OutboxBlob(
+                        index: index, kind: blob.kind, contentType: blob.contentType,
+                        filename: blob.filename, annotated: blob.annotated, size: blob.data.count
+                    )
+                }
+                loadBlob = { descriptor in
+                    pendingAttachments.indices.contains(descriptor.index)
+                        ? pendingAttachments[descriptor.index].data
+                        : nil
+                }
+            }
+
+            // 2/3. DELIVER, then ACK-then-delete (handled inside `deliver`).
+            self.deliver(
+                report: deliveryReport, blobs: blobs, loadBlob: loadBlob,
+                outbox: durableOutbox, configuration: configuration
+            ) { [weak self] result in
+                guard let self else { return }
+                if holding { self.endDelivery(of: reportId) }
+                switch result {
+                case .success(let id):
+                    self.notifyFeedbackSent(.success(id))
+                    completion(.success(.delivered(reportId: id)))
+                case .failure(.permanent(let error)):
+                    // 4. The server rejected it for good; the entry is already dropped.
                     self.notifyFeedbackSent(.failure(error))
                     completion(.failure(error))
+                case .failure(.retryable(let error)):
+                    // 5. Offline: the entry stays on disk and is delivered on reconnect. Report
+                    // it QUEUED (a success state) so the reporter dismisses normally instead of
+                    // showing "Couldn't send report"; onFeedbackSent fires when it lands.
+                    if queuedDurably {
+                        self.log("submit deferred (offline) — queued \(reportId)")
+                        completion(.success(.queued(reportId: reportId)))
+                    } else {
+                        self.notifyFeedbackSent(.failure(error))
+                        completion(.failure(error))
+                    }
                 }
             }
         }
@@ -448,6 +501,10 @@ public final class CatchDev: NSObject {
     /// **Callers must hold the entry's delivery claim** (``beginDelivery(of:)``) for the whole
     /// call: this reads and rewrites on-disk state that a second, concurrent delivery of the
     /// same entry would race.
+    ///
+    /// **Threading.** Call it on ``outboxQueue``. Every continuation that follows a network hop
+    /// is dispatched back onto it before it touches the outbox — never inline on the URLSession
+    /// completion thread, which belongs to the host.
     private func deliver(
         report: FeedbackReport,
         blobs: [OutboxBlob],
@@ -468,15 +525,20 @@ public final class CatchDev: NSObject {
                 // always survives to be retried — never deleted over an attachment.
                 completion(.failure(failure))
             case .success(let ready):
-                self.client.send(ready, configuration: configuration) { sendResult in
-                    switch sendResult {
-                    case .success(let id):
-                        outbox?.remove(reportId: report.reportId) // ack-then-delete
-                        completion(.success(id.isEmpty ? report.reportId : id))
-                    case .failure(let error):
-                        let failure = DeliveryFailure(error)
-                        if case .permanent = failure { outbox?.remove(reportId: report.reportId) }
-                        completion(.failure(failure))
+                self.client.send(ready, configuration: configuration) { [weak self] sendResult in
+                    guard let self else { return }
+                    // Back onto the outbox queue: deleting the entry is disk IO, and this
+                    // callback is running on the URLSession's delegate thread.
+                    self.outboxQueue.async {
+                        switch sendResult {
+                        case .success(let id):
+                            outbox?.remove(reportId: report.reportId) // ack-then-delete
+                            completion(.success(id.isEmpty ? report.reportId : id))
+                        case .failure(let error):
+                            let failure = DeliveryFailure(error)
+                            if case .permanent = failure { outbox?.remove(reportId: report.reportId) }
+                            completion(.failure(failure))
+                        }
                     }
                 }
             }
@@ -486,6 +548,9 @@ public final class CatchDev: NSObject {
     /// Upload the pending attachment blobs one at a time, appending each returned reference
     /// to the report (and persisting it) as soon as it lands — so a replay never re-uploads
     /// bytes that already reached R2.
+    ///
+    /// Runs on ``outboxQueue`` — including every recursive step, which is why the uploader's
+    /// completion hops back onto it before reading the next blob or writing a receipt.
     private func uploadBlobs(
         report: FeedbackReport,
         blobs: [OutboxBlob],
@@ -501,15 +566,23 @@ public final class CatchDev: NSObject {
         }
         let blob = blobs[index]
         guard let data = loadBlob(blob) else {
-            // The bytes are gone, so this blob already reached R2 and `markUploaded` persisted
-            // its reference into `report.json`. Adopt the persisted references before moving
-            // on — skipping the blob with nothing in hand would POST the report *without* its
-            // evidence and then ack-delete the only entry that still held the reference.
-            var next = report
-            let persisted = outbox?.entry(reportId: report.reportId)?.report.attachments ?? []
-            for attachment in persisted where !next.attachments.contains(attachment) {
-                next.attachments.append(attachment)
+            // The bytes we were told are still pending are GONE. "Gone" is only safe to read as
+            // "already uploaded" when the outbox can PROVE it — i.e. the entry is still on disk
+            // and holds a receipt for this exact blob index. Without that proof (the entry was
+            // evicted or corrupted under us) the honest answer is a RETRYABLE failure: skipping
+            // the blob with nothing in hand would POST the report *without* its evidence, and
+            // the 2xx ack would then delete the entry and make the loss permanent. That is
+            // precisely the bug the delivery claim exists to prevent — this is its backstop.
+            guard
+                let outbox,
+                let receipt = outbox.uploadedAttachment(reportId: report.reportId, index: blob.index)
+            else {
+                log("blob \(blob.index) of \(report.reportId) vanished with no receipt — retrying later")
+                completion(.failure(.retryable(CatchDevError.transport(OutboxError.blobMissing))))
+                return
             }
+            var next = report
+            if !next.attachments.contains(receipt) { next.attachments.append(receipt) }
             uploadBlobs(
                 report: next, blobs: blobs, index: index + 1, loadBlob: loadBlob,
                 outbox: outbox, configuration: configuration, completion: completion
@@ -521,36 +594,42 @@ public final class CatchDev: NSObject {
             filename: blob.filename, annotated: blob.annotated, configuration: configuration
         ) { [weak self] result in
             guard let self else { return }
-            switch result {
-            case .failure(let error):
-                let failure = DeliveryFailure(error)
-                guard case .permanent = failure else {
-                    // Offline / 5xx / rate-limited — keep the entry AND this blob for the
-                    // next flush.
-                    completion(.failure(failure))
-                    return
+            // Hop back to the outbox queue BEFORE touching the outbox: this callback is on the
+            // URLSession delegate thread (in production, `URLSession.shared`'s — the host app's
+            // too), and what follows writes a receipt / deletes bytes / reads the next 25–40 MB
+            // blob. The SDK does its disk work on its own queue, never on the host's threads.
+            self.outboxQueue.async {
+                switch result {
+                case .failure(let error):
+                    let failure = DeliveryFailure(error)
+                    guard case .permanent = failure else {
+                        // Offline / 5xx / rate-limited — keep the entry AND this blob for the
+                        // next flush.
+                        completion(.failure(failure))
+                        return
+                    }
+                    // The server refused THESE BYTES for good (413 too large, unsupported type).
+                    // Drop just this attachment and deliver the rest: the permanent-rejection rule
+                    // is about the report POST, and applying it to an attachment hop would destroy
+                    // the user's typed message — plus every attachment that already uploaded —
+                    // over one oversized file, identically on every retry.
+                    self.log("attachment \(blob.index) permanently rejected (\(error)) — dropped")
+                    outbox?.dropBlob(reportId: report.reportId, index: blob.index)
+                    self.uploadBlobs(
+                        report: report, blobs: blobs, index: index + 1, loadBlob: loadBlob,
+                        outbox: outbox, configuration: configuration, completion: completion
+                    )
+                case .success(let attachment):
+                    outbox?.markUploaded(
+                        reportId: report.reportId, blobIndex: blob.index, attachment: attachment
+                    )
+                    var next = report
+                    next.attachments.append(attachment)
+                    self.uploadBlobs(
+                        report: next, blobs: blobs, index: index + 1, loadBlob: loadBlob,
+                        outbox: outbox, configuration: configuration, completion: completion
+                    )
                 }
-                // The server refused THESE BYTES for good (413 too large, unsupported type).
-                // Drop just this attachment and deliver the rest: the permanent-rejection rule
-                // is about the report POST, and applying it to an attachment hop would destroy
-                // the user's typed message — plus every attachment that already uploaded —
-                // over one oversized file, identically on every retry.
-                self.log("attachment \(blob.index) permanently rejected (\(error)) — dropped")
-                outbox?.dropBlob(reportId: report.reportId, index: blob.index)
-                self.uploadBlobs(
-                    report: report, blobs: blobs, index: index + 1, loadBlob: loadBlob,
-                    outbox: outbox, configuration: configuration, completion: completion
-                )
-            case .success(let attachment):
-                outbox?.markUploaded(
-                    reportId: report.reportId, blobIndex: blob.index, attachment: attachment
-                )
-                var next = report
-                next.attachments.append(attachment)
-                self.uploadBlobs(
-                    report: next, blobs: blobs, index: index + 1, loadBlob: loadBlob,
-                    outbox: outbox, configuration: configuration, completion: completion
-                )
             }
         }
     }
@@ -562,9 +641,13 @@ public final class CatchDev: NSObject {
     ///
     /// Two latches keep this correct: `isFlushing` serializes flush-vs-flush (launch,
     /// reconnect, foreground can all fire at once), and the per-entry delivery claim
-    /// (``beginDelivery(of:)``) serializes flush-vs-`submit` — a report is in the outbox
-    /// while its own `submit` is still uploading it, and delivering it again from here would
-    /// double-send it.
+    /// (``beginDelivery(of:)``, which is the outbox's own `hold`) serializes flush-vs-`submit`
+    /// — a report is in the outbox while its own `submit` is still uploading it, and
+    /// delivering it again from here would double-send it.
+    ///
+    /// **Threading.** Called from `didFinishLaunching` (via `configure`), from the reachability
+    /// monitor, and on every foreground — so the whole drain runs on ``outboxQueue``, never on
+    /// the caller's thread.
     func flushPending() {
         guard let outbox else { return }
         let configuration = withLock { $0.configuration }
@@ -575,14 +658,21 @@ public final class CatchDev: NSObject {
             return true
         }
         guard shouldFlush else { return }
-        // Snapshot the IDs only. Each entry is re-read from disk immediately before it is
-        // delivered, because delivering the entries ahead of it takes seconds during which an
-        // in-flight submit can advance it (append an attachment reference, drop a blob's
-        // bytes) or finish it outright.
-        let reportIds = outbox.pending().map { $0.report.reportId }
-        flushNext(reportIds, index: 0, configuration: configuration, outbox: outbox)
+        outboxQueue.async { [weak self] in
+            // IDs only — `pending()` would read every queued entry's screenshot into memory
+            // just to build a work list. Each entry is re-read from disk immediately before it
+            // is delivered anyway, because delivering the entries ahead of it takes seconds
+            // during which an in-flight submit can advance it (record a receipt, drop a blob's
+            // bytes) or finish it outright.
+            guard let self else { return }
+            self.flushNext(
+                outbox.pendingReportIds(), index: 0, configuration: configuration, outbox: outbox
+            )
+        }
     }
 
+    /// Runs on ``outboxQueue`` (it reads the entry off disk); the network hops it kicks off
+    /// call back on their own threads and re-enter via `advance`, which hops back.
     private func flushNext(
         _ reportIds: [String],
         index: Int,
@@ -595,7 +685,10 @@ public final class CatchDev: NSObject {
         }
         let reportId = reportIds[index]
         let advance = { [weak self] in
-            self?.flushNext(reportIds, index: index + 1, configuration: configuration, outbox: outbox)
+            guard let self else { return }
+            self.outboxQueue.async {
+                self.flushNext(reportIds, index: index + 1, configuration: configuration, outbox: outbox)
+            }
         }
 
         // `submit` is delivering this entry right now — leave it alone.
@@ -644,12 +737,17 @@ public final class CatchDev: NSObject {
     /// loser POSTs its stale copy of the report and then ack-deletes the entry holding the
     /// winner's attachment references, losing the evidence for good. `isFlushing` cannot cover
     /// this; it only latches flush-vs-flush.
+    ///
+    /// The claim itself lives in ``FeedbackOutbox`` (`hold`/`release`), not here, because the
+    /// outbox is what *deletes* entries: a cap eviction firing mid-delivery would otherwise
+    /// delete the folder whose blobs a deliverer is uploading — the very loss this claim
+    /// exists to prevent. An SDK-side set could not be seen by `enforceCapacity`.
     private func beginDelivery(of reportId: String) -> Bool {
-        withLock { $0.deliveringReportIds.insert(reportId).inserted }
+        outbox?.hold(reportId) ?? true
     }
 
     private func endDelivery(of reportId: String) {
-        withLock { _ = $0.deliveringReportIds.remove(reportId) }
+        outbox?.release(reportId)
     }
 
     private func startReachabilityMonitorIfNeeded() {
@@ -748,9 +846,13 @@ public final class CatchDev: NSObject {
             return false
         }
         guard !alreadyObserved else { return }
-        // Returning to the foreground is a common moment connectivity is restored.
+        // Returning to the foreground is a common moment connectivity is restored. Observed on
+        // an explicit background queue: `queue: nil` delivers on the POSTING thread, which for
+        // `didBecomeActive` is the main thread — and the flush this fires reads the outbox.
         NotificationCenter.default.addObserver(
-            forName: UIApplication.didBecomeActiveNotification, object: nil, queue: nil
+            forName: UIApplication.didBecomeActiveNotification,
+            object: nil,
+            queue: notificationQueue
         ) { [weak self] _ in
             self?.flushPending()
         }

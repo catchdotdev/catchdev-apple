@@ -183,8 +183,7 @@ final class SeverityView: UIView {
         config.imagePadding = 7
         button.configuration = config
         button.layer.cornerRadius = 999
-        button.layer.borderWidth = 1
-        button.layer.borderColor = ReporterTheme.border.cgColor
+        button.cdvSetBorder(ReporterTheme.border)
         button.backgroundColor = ReporterTheme.elevated
         button.tintColor = ReporterTheme.textSoft
         button.accessibilityIdentifier = CatchDevReporterAccessibility.severity(severity)
@@ -198,7 +197,7 @@ final class SeverityView: UIView {
             let tone = ReporterTheme.severityTone(sev)
             let on = sev == severity
             button.backgroundColor = on ? tone.bg : ReporterTheme.elevated
-            button.layer.borderColor = (on ? tone.color : ReporterTheme.border).cgColor
+            button.cdvSetBorder(on ? tone.color : ReporterTheme.border)
             button.tintColor = on ? tone.color : ReporterTheme.textSoft
         }
     }
@@ -223,8 +222,7 @@ final class AreaDropdownView: UIView {
         button.translatesAutoresizingMaskIntoConstraints = false
         button.backgroundColor = ReporterTheme.fieldBg
         button.layer.cornerRadius = 12
-        button.layer.borderWidth = 1
-        button.layer.borderColor = ReporterTheme.border.cgColor
+        button.cdvSetBorder(ReporterTheme.border)
         button.contentHorizontalAlignment = .fill
         button.accessibilityIdentifier = CatchDevReporterAccessibility.area
         addSubview(button)
