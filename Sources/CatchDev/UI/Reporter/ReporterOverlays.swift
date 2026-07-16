@@ -118,7 +118,7 @@ final class SendingOverlayView: UIView {
 final class SuccessOverlayView: UIView {
     var onDone: (() -> Void)?
 
-    init(type: ReportType, reportId: String, queued: Bool = false) {
+    init(type: ReportType, reportId: String, queued: Bool = false, offline: Bool = true) {
         super.init(frame: .zero)
         backgroundColor = ReporterTheme.bg
         accessibilityIdentifier = queued
@@ -142,7 +142,9 @@ final class SuccessOverlayView: UIView {
 
         let subtitle = UILabel()
         if queued {
-            subtitle.text = "You're offline — we'll send it when you're back online."
+            subtitle.text = offline
+                ? "You're offline — we'll send it when you're back online."
+                : "We couldn't reach the server just now — we'll retry automatically."
         } else {
             subtitle.text = type == .bug
                 ? "Thanks — the team can see exactly what happened."

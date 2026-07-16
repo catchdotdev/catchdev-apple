@@ -549,8 +549,10 @@ final class ReporterViewController: UIViewController {
                     case .success(.delivered(let id)):
                         self.showSuccess(reportId: id.isEmpty ? self.reportId : id, queued: false)
                     case .success(.queued(let id)):
-                        // Durably saved, just not sent yet — a success, not an error.
-                        self.showSuccess(reportId: id, queued: true)
+                        // Durably saved, just not sent yet — a success, not an error. Distinguish
+                        // "you're offline" from "the server was briefly unreachable" by the device's
+                        // current reachability, so we don't claim offline to an online user.
+                        self.showSuccess(reportId: id, queued: true, offline: CatchDev.shared.isCurrentlyOffline())
                     case .failure(let error):
                         self.hideOverlay()
                         self.presentError(error)
@@ -560,8 +562,8 @@ final class ReporterViewController: UIViewController {
         }
     }
 
-    private func showSuccess(reportId: String, queued: Bool) {
-        let success = SuccessOverlayView(type: reportType, reportId: reportId, queued: queued)
+    private func showSuccess(reportId: String, queued: Bool, offline: Bool = false) {
+        let success = SuccessOverlayView(type: reportType, reportId: reportId, queued: queued, offline: offline)
         success.onDone = { [weak self] in self?.dismiss(animated: true) }
         showOverlay(success)
     }

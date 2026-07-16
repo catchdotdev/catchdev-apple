@@ -118,6 +118,9 @@ public final class CatchDev: NSObject {
     private var monitorStarted = false
     private var foregroundObserved = false
     private var pathMonitor: NWPathMonitor?
+    // The path monitor's most recent verdict. Defaults to reachable so we never tell an online
+    // user they're offline when reachability isn't being monitored / hasn't reported yet.
+    private var pathSatisfied = true
 
     private override init() {
         self.client = FeedbackClient()
@@ -760,10 +763,20 @@ public final class CatchDev: NSObject {
         guard !shouldStart else { return }
         let monitor = NWPathMonitor()
         monitor.pathUpdateHandler = { [weak self] path in
-            if path.status == .satisfied { self?.flushPending() }
+            let satisfied = path.status == .satisfied
+            self?.withLock { $0.pathSatisfied = satisfied }
+            if satisfied { self?.flushPending() }
         }
         monitor.start(queue: DispatchQueue(label: "dev.catch.reachability"))
         withLock { $0.pathMonitor = monitor }
+    }
+
+    /// Whether the device currently has no satisfied network path, per the outbox's reachability
+    /// monitor. Used by the reporter to tell "you're offline" apart from "the server was briefly
+    /// unreachable" on the queued overlay. Defaults to `false` (online) when reachability isn't
+    /// monitored, so an online user is never told they're offline.
+    func isCurrentlyOffline() -> Bool {
+        withLock { !$0.pathSatisfied }
     }
 
     /// Append a visited screen to the breadcrumb trail (no-op when automatic breadcrumbs
