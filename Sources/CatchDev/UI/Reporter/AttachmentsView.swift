@@ -84,8 +84,7 @@ final class AttachmentsView: UIView {
         button.tintColor = ReporterTheme.textSoft
         button.backgroundColor = ReporterTheme.elevated
         button.layer.cornerRadius = 13
-        button.layer.borderWidth = 1
-        button.layer.borderColor = ReporterTheme.border.cgColor
+        button.cdvSetBorder(ReporterTheme.border)
         button.accessibilityIdentifier = id
         button.heightAnchor.constraint(equalToConstant: 62).isActive = true
         button.addAction(UIAction { _ in action() }, for: .touchUpInside)
@@ -107,6 +106,11 @@ final class AttachmentsView: UIView {
         card.translatesAutoresizingMaskIntoConstraints = false
         card.backgroundColor = ReporterTheme.mutedBg
         card.layer.cornerRadius = 12
+        // Without a border a light screenshot is indistinguishable from the sheet behind it —
+        // the thumbnail reads as floating in space. Drawn on the card's own layer, so it sits
+        // above the image (CALayer renders its border above its sublayers) and applies to every
+        // attachment kind. Matches the 1pt border on the description box and the Area field.
+        card.cdvSetBorder(ReporterTheme.border)
         card.clipsToBounds = true
         card.accessibilityIdentifier = CatchDevReporterAccessibility.attachment(index)
         NSLayoutConstraint.activate([
@@ -122,15 +126,25 @@ final class AttachmentsView: UIView {
             imageView.translatesAutoresizingMaskIntoConstraints = false
             card.addSubview(imageView)
             pin(imageView, to: card)
-            let badge = makeBadge(
-                title: attachment.annotated ? "Annotated" : "Annotate",
-                symbol: "pencil"
+
+            // Mark up an existing screenshot. Mirrors the remove button in the opposite corner,
+            // so both actions on a thumbnail are where the eye already looks.
+            let edit = makeCornerButton(
+                symbol: "pencil",
+                identifier: CatchDevReporterAccessibility.attachmentEdit(index),
+                label: "Annotate screenshot"
             ) { [weak self] in self?.onAnnotate?(attachment.id) }
-            card.addSubview(badge)
+            card.addSubview(edit)
             NSLayoutConstraint.activate([
-                badge.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 5),
-                badge.bottomAnchor.constraint(equalTo: card.bottomAnchor, constant: -5),
+                edit.topAnchor.constraint(equalTo: card.topAnchor, constant: 5),
+                edit.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 5),
             ])
+
+            // State only — the pencil above is the action. No icon: "Annotated" is already the
+            // widest label a 74pt card can take (see `addBadge`).
+            if attachment.annotated {
+                addBadge(title: "Annotated", symbol: nil, to: card)
+            }
         case .recording:
             card.backgroundColor = UIColor(white: 0.1, alpha: 1)
             let play = UIImageView(image: ReporterStyle.symbolImage("play.fill", pointSize: 16))
@@ -141,12 +155,7 @@ final class AttachmentsView: UIView {
                 play.centerXAnchor.constraint(equalTo: card.centerXAnchor),
                 play.centerYAnchor.constraint(equalTo: card.centerYAnchor),
             ])
-            let badge = makeBadge(title: "Video", symbol: "video", action: nil)
-            card.addSubview(badge)
-            NSLayoutConstraint.activate([
-                badge.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 5),
-                badge.bottomAnchor.constraint(equalTo: card.bottomAnchor, constant: -5),
-            ])
+            addBadge(title: "Video", symbol: "video", to: card)
         case .file:
             card.backgroundColor = ReporterTheme.elevated
             let icon = UIImageView(image: ReporterStyle.symbolImage("paperclip", pointSize: 15))
@@ -176,44 +185,84 @@ final class AttachmentsView: UIView {
             ])
         }
 
-        let remove = UIButton(type: .system)
-        remove.setImage(ReporterStyle.symbolImage("xmark", pointSize: 9, weight: .bold), for: .normal)
-        remove.tintColor = .white
-        remove.backgroundColor = UIColor(white: 0, alpha: 0.7)
-        remove.layer.cornerRadius = 10
-        remove.translatesAutoresizingMaskIntoConstraints = false
-        remove.accessibilityIdentifier = CatchDevReporterAccessibility.attachmentRemove(index)
-        remove.addAction(UIAction { [weak self] _ in self?.onRemove?(attachment.id) }, for: .touchUpInside)
+        let remove = makeCornerButton(
+            symbol: "xmark",
+            identifier: CatchDevReporterAccessibility.attachmentRemove(index),
+            label: "Remove attachment"
+        ) { [weak self] in self?.onRemove?(attachment.id) }
         card.addSubview(remove)
         NSLayoutConstraint.activate([
-            remove.widthAnchor.constraint(equalToConstant: 20),
-            remove.heightAnchor.constraint(equalToConstant: 20),
             remove.topAnchor.constraint(equalTo: card.topAnchor, constant: 5),
             remove.trailingAnchor.constraint(equalTo: card.trailingAnchor, constant: -5),
         ])
         return card
     }
 
-    private func makeBadge(title: String, symbol: String, action: (() -> Void)?) -> UIView {
+    /// A 20pt circular action pinned to a thumbnail's corner (annotate, remove).
+    private func makeCornerButton(
+        symbol: String,
+        identifier: String,
+        label: String,
+        action: @escaping () -> Void
+    ) -> UIButton {
         let button = UIButton(type: .system)
+        button.setImage(ReporterStyle.symbolImage(symbol, pointSize: 9, weight: .bold), for: .normal)
+        button.tintColor = .white
+        button.backgroundColor = UIColor(white: 0, alpha: 0.7)
+        button.layer.cornerRadius = 10
+        button.clipsToBounds = true
+        button.translatesAutoresizingMaskIntoConstraints = false
+        button.accessibilityIdentifier = identifier
+        button.accessibilityLabel = label
+        button.addAction(UIAction { _ in action() }, for: .touchUpInside)
+        NSLayoutConstraint.activate([
+            button.widthAnchor.constraint(equalToConstant: 20),
+            button.heightAnchor.constraint(equalToConstant: 20),
+        ])
+        return button
+    }
+
+    /// A state pill in a thumbnail's bottom-left corner ("Annotated", "Video"). Never
+    /// interactive — the corner buttons are the actions.
+    ///
+    /// The card is only 74pt wide and clips to its bounds, so a badge that overflows is not
+    /// merely ugly, it is *cut in half*: "Annotated" at the old metrics (10.5pt + a checkmark
+    /// + 14pt of insets) wanted ~79pt against the 64pt between the two 5pt margins. It fits now
+    /// on two counts — the metrics are sized for the card (no icon on the long label), and the
+    /// trailing constraint is a hard ceiling, so any future label compresses rather than
+    /// spilling under the clip.
+    private func addBadge(title: String, symbol: String?, to card: UIView) {
+        let badge = UIButton(type: .system)
+        // Callers pin this with Auto Layout. Without this the autoresizing-mask constraints
+        // fight those, UIKit resolves the conflict by collapsing the badge to zero size, and it
+        // silently never renders — which is exactly what happened to the Annotate/Video badges.
+        badge.translatesAutoresizingMaskIntoConstraints = false
         var config = UIButton.Configuration.plain()
         config.title = title
-        config.image = ReporterStyle.symbolImage(symbol, pointSize: 9)
-        config.imagePadding = 4
-        config.contentInsets = .init(top: 3, leading: 7, bottom: 3, trailing: 7)
+        config.titleLineBreakMode = .byTruncatingTail
+        if let symbol {
+            config.image = ReporterStyle.symbolImage(symbol, pointSize: 8.5)
+            config.imagePadding = 3
+        }
+        config.contentInsets = .init(top: 3, leading: 6, bottom: 3, trailing: 6)
         config.titleTextAttributesTransformer = .init { incoming in
             var out = incoming
-            out.font = .systemFont(ofSize: 10.5, weight: .medium)
+            out.font = .systemFont(ofSize: 9.5, weight: .semibold)
             return out
         }
-        button.configuration = config
-        button.tintColor = .white
-        button.backgroundColor = UIColor(white: 0, alpha: 0.78)
-        button.layer.cornerRadius = 11
-        button.clipsToBounds = true
-        button.isUserInteractionEnabled = action != nil
-        if let action { button.addAction(UIAction { _ in action() }, for: .touchUpInside) }
-        return button
+        badge.configuration = config
+        badge.tintColor = .white
+        badge.backgroundColor = UIColor(white: 0, alpha: 0.78)
+        badge.layer.cornerRadius = 9
+        badge.clipsToBounds = true
+        badge.isUserInteractionEnabled = false
+
+        card.addSubview(badge)
+        NSLayoutConstraint.activate([
+            badge.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 5),
+            badge.bottomAnchor.constraint(equalTo: card.bottomAnchor, constant: -5),
+            badge.trailingAnchor.constraint(lessThanOrEqualTo: card.trailingAnchor, constant: -5),
+        ])
     }
 
     private func pin(_ view: UIView, to container: UIView) {

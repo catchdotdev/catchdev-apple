@@ -40,6 +40,10 @@ final class ReporterViewController: UIViewController {
     // Snapshot the global toggle once per presentation so `buildBody` (shows the field) and
     // `send` (reads it) always agree, even if a host flips the flag while the reporter is up.
     private let contactFieldEnabled = CatchDev.isContactFieldEnabled
+    // Snapshotted for the same reason: `buildBody` decides whether the Area field exists, and
+    // `presentAreaPicker` fills the wheel. A host mutating the list mid-presentation must not
+    // leave a field whose picker has nothing in it.
+    private let areas = CatchDev.areas
 
     // Views
     private let scrollView = UIScrollView()
@@ -47,7 +51,6 @@ final class ReporterViewController: UIViewController {
     private let tabsView = SegmentedTabsView()
     private let descriptionTextView = UITextView()
     private let placeholderLabel = UILabel()
-    private let titlePreviewLabel = UILabel()
     private let severityView = SeverityView()
     private var severitySection: UIView!
     private let areaDropdown = AreaDropdownView()
@@ -115,6 +118,37 @@ final class ReporterViewController: UIViewController {
         if isBeingDismissed || (navigationController?.isBeingDismissed ?? false) {
             notifyClose()
         }
+    }
+
+    /// Borders are `CGColor` snapshots of dynamic colours (see ``UIView/cdvSetBorder(_:width:)``),
+    /// so they are the one thing that does NOT follow a light↔dark switch made while the
+    /// reporter is open. Re-resolve them; every other colour updates itself.
+    ///
+    /// Resolved against **this view controller's** traits, never the subviews' own: when this
+    /// callback fires, UIKit has updated the VC's `traitCollection` but not yet the view subtree's
+    /// (they still report the appearance the user just left), so a per-view refresh writes the
+    /// stale colour straight back — see ``UIView/cdvRefreshBorders(with:)``.
+    override func traitCollectionDidChange(_ previous: UITraitCollection?) {
+        super.traitCollectionDidChange(previous)
+        guard traitCollection.hasDifferentColorAppearance(comparedTo: previous) else { return }
+        view.cdvRefreshBorders(with: traitCollection)
+        // Belt and braces: resolve once more after the current run-loop turn, when EVERY trait
+        // environment in the hierarchy has settled on the new appearance. It makes the refresh
+        // independent of who UIKit updates first (the pass above assumes the VC — which is what
+        // it observably does), and it is ~30 layer writes with nothing else to do.
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.view.cdvRefreshBorders(with: self.traitCollection)
+        }
+    }
+
+    /// The reporter can be built (and its borders first resolved) before it is in a window — and
+    /// a detached view inherits whatever traits happened to be current, not the window's. Resolve
+    /// them once more now that the hierarchy is real, so a reporter opened in dark mode never
+    /// shows a light border.
+    override func viewWillAppear(_ animated: Bool) {
+        super.viewWillAppear(animated)
+        view.cdvRefreshBorders(with: traitCollection)
     }
 
     // MARK: - Build UI
@@ -190,7 +224,10 @@ final class ReporterViewController: UIViewController {
         contentStack.addArrangedSubview(makeDescriptionSection())
         severitySection = makeSeveritySection()
         contentStack.addArrangedSubview(severitySection)
-        contentStack.addArrangedSubview(makeAreaSection())
+        // A host that supplies no areas gets no Area field — an empty picker is worse than none.
+        if !areas.isEmpty {
+            contentStack.addArrangedSubview(makeAreaSection())
+        }
         contentStack.addArrangedSubview(makeAttachmentsSection())
         if contactFieldEnabled {
             contentStack.addArrangedSubview(makeContactSection())
@@ -201,8 +238,7 @@ final class ReporterViewController: UIViewController {
         let box = UIView()
         box.backgroundColor = ReporterTheme.fieldBg
         box.layer.cornerRadius = 13
-        box.layer.borderWidth = 1
-        box.layer.borderColor = ReporterTheme.border.cgColor
+        box.cdvSetBorder(ReporterTheme.border)
 
         descriptionTextView.backgroundColor = .clear
         descriptionTextView.font = .systemFont(ofSize: 16)
@@ -230,15 +266,7 @@ final class ReporterViewController: UIViewController {
             placeholderLabel.leadingAnchor.constraint(equalTo: box.leadingAnchor, constant: 15),
         ])
 
-        titlePreviewLabel.font = .systemFont(ofSize: 12)
-        titlePreviewLabel.textColor = ReporterTheme.textMuted
-        titlePreviewLabel.accessibilityIdentifier = CatchDevReporterAccessibility.titlePreview
-        titlePreviewLabel.isHidden = true
-
-        let column = UIStackView(arrangedSubviews: [box, titlePreviewLabel])
-        column.axis = .vertical
-        column.spacing = 8
-        return column
+        return box
     }
 
     private func makeSeveritySection() -> UIView {
@@ -254,6 +282,7 @@ final class ReporterViewController: UIViewController {
 
     private func makeAreaSection() -> UIView {
         areaDropdown.onChange = { [weak self] value in self?.area = value }
+        areaDropdown.onOpen = { [weak self] in self?.presentAreaPicker() }
         let column = UIStackView(arrangedSubviews: [
             ReporterStyle.sectionLabel("Area", optional: true),
             areaDropdown,
@@ -284,8 +313,7 @@ final class ReporterViewController: UIViewController {
         contactField.textColor = ReporterTheme.text
         contactField.backgroundColor = ReporterTheme.fieldBg
         contactField.layer.cornerRadius = 12
-        contactField.layer.borderWidth = 1
-        contactField.layer.borderColor = ReporterTheme.border.cgColor
+        contactField.cdvSetBorder(ReporterTheme.border)
         contactField.keyboardType = .emailAddress
         contactField.autocapitalizationType = .none
         contactField.autocorrectionType = .no
@@ -368,7 +396,6 @@ final class ReporterViewController: UIViewController {
             ? "What happened? What did you expect?"
             : "What would make this better?"
         placeholderLabel.isHidden = !currentDraft.isEmpty
-        updateTitlePreview()
         tabsView.setSelected(reportType, animated: animated)
         let show = reportType == .bug
         UIView.animate(withDuration: animated ? 0.2 : 0) {
@@ -376,24 +403,16 @@ final class ReporterViewController: UIViewController {
         }
     }
 
-    private func updateTitlePreview() {
-        let title = Self.deriveTitle(descriptionTextView.text ?? "")
-        if let title {
-            titlePreviewLabel.text = "TITLE  “\(title)” · auto"
-            titlePreviewLabel.isHidden = false
-        } else {
-            titlePreviewLabel.isHidden = true
+    private func presentAreaPicker() {
+        descriptionTextView.resignFirstResponder()
+        let picker = AreaPickerSheetViewController(
+            areas: areas,
+            selected: areaDropdown.selected,
+            bottomInset: view.safeAreaInsets.bottom
+        ) { [weak self] area in
+            self?.areaDropdown.choose(area)
         }
-    }
-
-    static func deriveTitle(_ text: String) -> String? {
-        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-            .replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
-        guard trimmed.count >= 6 else { return nil }
-        let words = trimmed.split(separator: " ")
-        let head = words.prefix(7).joined(separator: " ")
-        let capitalized = head.prefix(1).uppercased() + head.dropFirst()
-        return capitalized + (words.count > 7 ? "…" : "")
+        present(picker, animated: true)
     }
 
     private func refreshAttachments() {
@@ -464,71 +483,87 @@ final class ReporterViewController: UIViewController {
         }
         view.endEditing(true)
         let contact = contactFieldEnabled ? contactField.text : nil
-        let pending = attachments
+        // Hand the RAW bytes to the SDK: it persists the report + these blobs to the durable
+        // outbox BEFORE any network call, then uploads and posts. Uploading here first would
+        // fail offline before anything was saved — which is exactly the bug this replaces.
+        let pending = attachments.map {
+            PendingBlob(
+                kind: $0.kind, data: $0.data, contentType: $0.contentType,
+                filename: $0.filename, annotated: $0.annotated
+            )
+        }
 
         let overlay = SendingOverlayView(steps: [
             "Bundling breadcrumbs", "Attaching context", "Uploading attachments", "Posting to Catch",
         ])
         showOverlay(overlay)
 
-        uploadAll(pending, uploaded: []) { [weak self] result in
-            guard let self else { return }
-            switch result {
-            case .failure(let error):
+        // `submit` persists the report and every attachment's bytes to disk SYNCHRONOUSLY, on the
+        // thread that calls it, before it returns — that is what makes a submission survive the
+        // process dying (see the persist comment in `CatchDev.submit`). A screen recording is
+        // 25–40 MB, so that write must not happen on the main thread: run it on a background
+        // queue and come back to main for the UI. The reporter's "Sending report…" overlay is
+        // already up, so there is nothing for the user to interact with while it lands.
+        //
+        // Mirrors the Android reporter, which submits on its `uploadExecutor` for the same reason.
+        let submitState = (
+            type: reportType,
+            severity: reportType == .bug ? severity : nil,
+            area: area,
+            screenName: screenName,
+            excluded: excluded,
+            reportId: reportId
+        )
+        // Backgrounding the app the instant you tap Send (home gesture, an incoming call) is an
+        // ordinary thing to do, and iOS will suspend — later jetsam — the process part-way through
+        // the write. Hold an assertion across it so the entry lands whole. Taken here, on the main
+        // thread, because that is where UIApplication may be touched.
+        var assertion: UIBackgroundTaskIdentifier = .invalid
+        let endAssertion = {
+            guard assertion != .invalid else { return }
+            UIApplication.shared.endBackgroundTask(assertion)
+            assertion = .invalid
+        }
+        assertion = UIApplication.shared.beginBackgroundTask(withName: "dev.catch.send") {
+            // Expired: iOS wants the time back. Must end it or the host app is killed.
+            DispatchQueue.main.async(execute: endAssertion)
+        }
+
+        DispatchQueue.global(qos: .userInitiated).async {
+            CatchDev.shared.submit(
+                message: message,
+                imageData: nil,
+                type: submitState.type,
+                severity: submitState.severity,
+                area: submitState.area,
+                contactEmail: contact,
+                pendingAttachments: pending,
+                reportId: submitState.reportId,
+                screenName: submitState.screenName,
+                excludedDiagnostics: submitState.excluded
+            ) { [weak self] result in
                 DispatchQueue.main.async {
-                    self.hideOverlay()
-                    self.presentError(error)
-                }
-            case .success(let uploaded):
-                CatchDev.shared.submit(
-                    message: message,
-                    imageData: nil,
-                    type: self.reportType,
-                    severity: self.reportType == .bug ? self.severity : nil,
-                    area: self.area,
-                    contactEmail: contact,
-                    attachments: uploaded,
-                    reportId: self.reportId,
-                    screenName: self.screenName,
-                    excludedDiagnostics: self.excluded
-                ) { submitResult in
-                    DispatchQueue.main.async {
-                        switch submitResult {
-                        case .success(let id):
-                            self.showSuccess(reportId: id.isEmpty ? self.reportId : id)
-                        case .failure(let error):
-                            self.hideOverlay()
-                            self.presentError(error)
-                        }
+                    endAssertion()
+                    guard let self else { return }
+                    switch result {
+                    case .success(.delivered(let id)):
+                        self.showSuccess(reportId: id.isEmpty ? self.reportId : id, queued: false)
+                    case .success(.queued(let id)):
+                        // Durably saved, just not sent yet — a success, not an error. Distinguish
+                        // "you're offline" from "the server was briefly unreachable" by the device's
+                        // current reachability, so we don't claim offline to an online user.
+                        self.showSuccess(reportId: id, queued: true, offline: CatchDev.shared.isCurrentlyOffline())
+                    case .failure(let error):
+                        self.hideOverlay()
+                        self.presentError(error)
                     }
                 }
             }
         }
     }
 
-    /// Upload pending attachments one at a time, collecting their references.
-    private func uploadAll(
-        _ remaining: [PendingAttachment],
-        uploaded: [Attachment],
-        completion: @escaping (Result<[Attachment], Error>) -> Void
-    ) {
-        guard let next = remaining.first else { completion(.success(uploaded)); return }
-        CatchDev.shared.uploadAttachment(
-            data: next.data, kind: next.kind, contentType: next.contentType,
-            filename: next.filename, annotated: next.annotated
-        ) { [weak self] result in
-            guard let self else { return }
-            switch result {
-            case .failure(let error):
-                completion(.failure(error))
-            case .success(let attachment):
-                self.uploadAll(Array(remaining.dropFirst()), uploaded: uploaded + [attachment], completion: completion)
-            }
-        }
-    }
-
-    private func showSuccess(reportId: String) {
-        let success = SuccessOverlayView(type: reportType, reportId: reportId)
+    private func showSuccess(reportId: String, queued: Bool, offline: Bool = false) {
+        let success = SuccessOverlayView(type: reportType, reportId: reportId, queued: queued, offline: offline)
         success.onDone = { [weak self] in self?.dismiss(animated: true) }
         showOverlay(success)
     }
@@ -652,7 +687,6 @@ final class ReporterViewController: UIViewController {
 extension ReporterViewController: UITextViewDelegate {
     func textViewDidChange(_ textView: UITextView) {
         placeholderLabel.isHidden = !(textView.text ?? "").isEmpty
-        updateTitlePreview()
     }
 }
 

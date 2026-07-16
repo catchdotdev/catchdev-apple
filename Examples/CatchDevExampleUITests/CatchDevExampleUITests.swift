@@ -92,22 +92,50 @@ final class CatchDevExampleUITests: XCTestCase {
         openReporter(app)
         let area = app.buttons["catchdev.reporter.area"]
         area.tap()
-        let option = app.buttons["catchdev.reporter.area.payments"]
-        if option.waitForExistence(timeout: 3) {
-            option.tap()
-        } else {
-            app.menuItems["catchdev.reporter.area.payments"].tap()
-        }
+
+        // The options live on a picker wheel, so there are no per-row elements to tap:
+        // spin the wheel, then commit with Done.
+        let wheel = app.pickerWheels.firstMatch
+        XCTAssertTrue(wheel.waitForExistence(timeout: 3), "The area picker sheet should open on tap")
+        wheel.adjust(toPickerWheelValue: "Payments")
+        app.buttons["catchdev.reporter.area.done"].tap()
+
         XCTAssertTrue(area.label.contains("Payments"), "Area button should reflect the choice")
     }
 
-    func testAutoTitleAppears() {
+    func testAreaCancelKeepsThePreviousValue() {
         let app = launchApp()
-        let message = openReporter(app)
-        message.tap()
-        message.typeText("The settings page never loads my profile")
-        XCTAssertTrue(app.staticTexts["catchdev.reporter.title"].waitForExistence(timeout: 3),
-                      "An auto-derived title should appear once enough text is typed")
+        openReporter(app)
+        let area = app.buttons["catchdev.reporter.area"]
+
+        area.tap()
+        app.pickerWheels.firstMatch.adjust(toPickerWheelValue: "Payments")
+        app.buttons["catchdev.reporter.area.done"].tap()
+
+        // Spinning the wheel and then cancelling must NOT commit the new row.
+        area.tap()
+        app.pickerWheels.firstMatch.adjust(toPickerWheelValue: "Performance")
+        app.buttons["catchdev.reporter.area.cancel"].tap()
+
+        XCTAssertTrue(area.label.contains("Payments"), "Cancel should leave the previous area intact")
+    }
+
+    func testAreaNoneRowClearsTheSelection() {
+        let app = launchApp()
+        openReporter(app)
+        let area = app.buttons["catchdev.reporter.area"]
+
+        area.tap()
+        app.pickerWheels.firstMatch.adjust(toPickerWheelValue: "Payments")
+        app.buttons["catchdev.reporter.area.done"].tap()
+        XCTAssertTrue(area.label.contains("Payments"))
+
+        // Area is optional: the synthetic "None" row is how a wheel expresses "no selection".
+        area.tap()
+        app.pickerWheels.firstMatch.adjust(toPickerWheelValue: "None")
+        app.buttons["catchdev.reporter.area.done"].tap()
+
+        XCTAssertTrue(area.label.contains("Choose an area"), "None should clear the area back to the placeholder")
     }
 
     func testScreenshotAttachmentIsPresentByDefault() {
@@ -128,6 +156,22 @@ final class CatchDevExampleUITests: XCTestCase {
         let start = app.coordinate(withNormalizedOffset: CGVector(dx: 0.35, dy: 0.4))
         let end = app.coordinate(withNormalizedOffset: CGVector(dx: 0.65, dy: 0.6))
         start.press(forDuration: 0.1, thenDragTo: end)
+        done.tap()
+        XCTAssertTrue(message.waitForExistence(timeout: 3), "Should return to the form after Done")
+    }
+
+    /// The pencil on the thumbnail is the way to mark up a screenshot that is ALREADY attached
+    /// (the Screenshot tool button re-annotates the primary one). Nothing covered this before.
+    func testEditButtonOnThumbnailOpensAnnotate() {
+        let app = launchApp()
+        let message = openReporter(app)
+
+        let edit = app.buttons["catchdev.reporter.attachment.edit.0"]
+        XCTAssertTrue(edit.waitForExistence(timeout: 3), "The attached screenshot should offer an edit button")
+        edit.tap()
+
+        let done = app.buttons["catchdev.reporter.annotate.done"]
+        XCTAssertTrue(done.waitForExistence(timeout: 3), "Edit should open the annotate screen")
         done.tap()
         XCTAssertTrue(message.waitForExistence(timeout: 3), "Should return to the form after Done")
     }

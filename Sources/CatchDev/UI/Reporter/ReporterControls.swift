@@ -183,8 +183,7 @@ final class SeverityView: UIView {
         config.imagePadding = 7
         button.configuration = config
         button.layer.cornerRadius = 999
-        button.layer.borderWidth = 1
-        button.layer.borderColor = ReporterTheme.border.cgColor
+        button.cdvSetBorder(ReporterTheme.border)
         button.backgroundColor = ReporterTheme.elevated
         button.tintColor = ReporterTheme.textSoft
         button.accessibilityIdentifier = CatchDevReporterAccessibility.severity(severity)
@@ -198,7 +197,7 @@ final class SeverityView: UIView {
             let tone = ReporterTheme.severityTone(sev)
             let on = sev == severity
             button.backgroundColor = on ? tone.bg : ReporterTheme.elevated
-            button.layer.borderColor = (on ? tone.color : ReporterTheme.border).cgColor
+            button.cdvSetBorder(on ? tone.color : ReporterTheme.border)
             button.tintColor = on ? tone.color : ReporterTheme.textSoft
         }
     }
@@ -212,8 +211,9 @@ final class SeverityView: UIView {
 // MARK: - Area dropdown
 
 final class AreaDropdownView: UIView {
-    static let areas = ["Login", "Payments", "Performance", "Other"]
     var onChange: ((String?) -> Void)?
+    /// Fired when the field is tapped; the reporter presents the picker sheet.
+    var onOpen: (() -> Void)?
     private(set) var selected: String?
     private let button = UIButton(type: .system)
 
@@ -222,8 +222,7 @@ final class AreaDropdownView: UIView {
         button.translatesAutoresizingMaskIntoConstraints = false
         button.backgroundColor = ReporterTheme.fieldBg
         button.layer.cornerRadius = 12
-        button.layer.borderWidth = 1
-        button.layer.borderColor = ReporterTheme.border.cgColor
+        button.cdvSetBorder(ReporterTheme.border)
         button.contentHorizontalAlignment = .fill
         button.accessibilityIdentifier = CatchDevReporterAccessibility.area
         addSubview(button)
@@ -234,39 +233,22 @@ final class AreaDropdownView: UIView {
             button.trailingAnchor.constraint(equalTo: trailingAnchor),
             button.heightAnchor.constraint(equalToConstant: 48),
         ])
-        button.menu = makeMenu()
-        button.showsMenuAsPrimaryAction = true
+        button.addAction(UIAction { [weak self] _ in self?.onOpen?() }, for: .touchUpInside)
         render()
     }
 
     @available(*, unavailable)
     required init?(coder: NSCoder) { fatalError() }
 
-    private func makeMenu() -> UIMenu {
-        var actions: [UIAction] = Self.areas.map { area in
-            let action = UIAction(title: area) { [weak self] _ in self?.choose(area) }
-            action.accessibilityIdentifier = CatchDevReporterAccessibility.areaOption(area)
-            action.state = selected == area ? .on : .off
-            return action
-        }
-        if selected != nil {
-            actions.append(UIAction(title: "Clear", attributes: .destructive) { [weak self] _ in
-                self?.choose(nil)
-            })
-        }
-        return UIMenu(children: actions)
-    }
-
-    private func choose(_ area: String?) {
+    /// Applies a selection made in the picker sheet and notifies the reporter.
+    func choose(_ area: String?) {
         selected = area
-        button.menu = makeMenu()
         render()
         onChange?(area)
     }
 
     func setSelected(_ area: String?) {
         selected = area
-        button.menu = makeMenu()
         render()
     }
 

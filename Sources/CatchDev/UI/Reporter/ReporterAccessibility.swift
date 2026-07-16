@@ -13,20 +13,20 @@ public enum CatchDevReporterAccessibility {
     public static let tabFeedback = "catchdev.reporter.tab.feedback"
     public static let tabBug = "catchdev.reporter.tab.bug"
 
-    // Description + derived title
+    // Description
     public static let message = "catchdev.reporter.message"
-    public static let titlePreview = "catchdev.reporter.title"
 
     // Severity (bug only)
     public static func severity(_ value: Severity) -> String {
         "catchdev.reporter.severity.\(value.rawValue)"
     }
 
-    // Area dropdown
+    // Area picker. The options live on a UIPickerView wheel, which has no per-row elements —
+    // UI tests drive it with `pickerWheels.adjust(toPickerWheelValue:)` and commit with Done.
     public static let area = "catchdev.reporter.area"
-    public static func areaOption(_ name: String) -> String {
-        "catchdev.reporter.area.\(name.lowercased())"
-    }
+    public static let areaWheel = "catchdev.reporter.area.wheel"
+    public static let areaDone = "catchdev.reporter.area.done"
+    public static let areaCancel = "catchdev.reporter.area.cancel"
 
     // Tools
     public static let toolScreenshot = "catchdev.reporter.tool.screenshot"
@@ -40,6 +40,10 @@ public enum CatchDevReporterAccessibility {
     }
     public static func attachmentRemove(_ index: Int) -> String {
         "catchdev.reporter.attachment.remove.\(index)"
+    }
+    /// Opens the annotate screen for an existing screenshot attachment.
+    public static func attachmentEdit(_ index: Int) -> String {
+        "catchdev.reporter.attachment.edit.\(index)"
     }
 
     // Diagnostics disclosure
@@ -67,6 +71,8 @@ public enum CatchDevReporterAccessibility {
     // Sending / success overlays
     public static let sending = "catchdev.reporter.sending"
     public static let success = "catchdev.reporter.success"
+    /// The success overlay in its offline "saved, we'll send it later" form.
+    public static let queued = "catchdev.reporter.queued"
     public static let successDone = "catchdev.reporter.success.done"
 }
 #endif
