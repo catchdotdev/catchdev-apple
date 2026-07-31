@@ -49,19 +49,37 @@ final class ReporterRecordingSession {
         window?.hide()
         window = nil
         recorder.stopRecording { result in
-            DispatchQueue.main.async {
-                if case .success(let url) = result {
-                    if let data = try? Data(contentsOf: url) {
+            guard case .success(let url) = result else {
+                DispatchQueue.main.async { CatchDev.shared.presentReporter() }
+                return
+            }
+            // Read bounded and off the main queue: nothing limits how long the
+            // user records, so a few minutes of 1080p is hundreds of megabytes
+            // and reading it whole on the main thread hangs the host app.
+            DispatchQueue.global(qos: .userInitiated).async {
+                let cap = AttachmentLimits.maxRecordingBytes
+                let declared = AttachmentLimits.declaredSize(of: url)
+                let data: Data? = (declared.map { $0 > cap } ?? false)
+                    ? nil
+                    : AttachmentLimits.readCapped(url: url, limit: cap + 1)
+                try? FileManager.default.removeItem(at: url) // don't leak the temp .mp4
+
+                DispatchQueue.main.async {
+                    if let data, data.count <= cap {
                         ReporterViewController.pendingRestore?.attachments.append(
                             PendingAttachment(
                                 kind: .recording, data: data,
                                 contentType: "video/mp4", filename: "recording.mp4"
                             )
                         )
+                    } else {
+                        // Over the cap (or unreadable): drop the clip rather than
+                        // the draft — the reporter still reopens with the note intact.
+                        ReporterViewController.pendingRestore?.droppedRecordingReason =
+                            "That recording is too large (max \(AttachmentLimits.humanReadable(cap))). Try a shorter one."
                     }
-                    try? FileManager.default.removeItem(at: url) // don't leak the temp .mp4
+                    CatchDev.shared.presentReporter()
                 }
-                CatchDev.shared.presentReporter()
             }
         }
     }

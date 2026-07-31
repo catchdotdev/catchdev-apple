@@ -57,5 +57,9 @@ struct ReporterRestoreState {
     var attachments: [PendingAttachment]
     var screenName: String?
     var reportId: String
+    /// Set when a finished recording was discarded (over the size cap or
+    /// unreadable) so the reopened reporter can say why, instead of the clip
+    /// silently vanishing.
+    var droppedRecordingReason: String?
 }
 #endif

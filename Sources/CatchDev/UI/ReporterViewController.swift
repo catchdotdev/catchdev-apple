@@ -613,7 +613,8 @@ final class ReporterViewController: UIViewController {
         ReporterViewController.pendingRestore = ReporterRestoreState(
             drafts: drafts, tab: reportType, severity: severity, area: area,
             contact: contactField.text ?? "", excluded: excluded,
-            attachments: attachments, screenName: screenName, reportId: reportId
+            attachments: attachments, screenName: screenName, reportId: reportId,
+            droppedRecordingReason: nil
         )
         // Only tear the reporter down once recording is actually rolling. If it can't start
         // (Simulator, denied permission, ReplayKit error), keep the reporter up and tell the
@@ -649,6 +650,13 @@ final class ReporterViewController: UIViewController {
         contactField.text = state.contact
         severityView.setSelected(state.severity)
         areaDropdown.setSelected(state.area)
+        if let reason = state.droppedRecordingReason {
+            // Surface it after the reporter is on screen, so the alert has a
+            // presenter — the draft survived, only the clip was dropped.
+            DispatchQueue.main.async { [weak self] in
+                self?.presentAttachmentAlert(reason)
+            }
+        }
     }
 
     // MARK: - Keyboard
@@ -693,15 +701,62 @@ extension ReporterViewController: UITextViewDelegate {
 extension ReporterViewController: UIDocumentPickerDelegate {
     func documentPicker(_ controller: UIDocumentPickerViewController, didPickDocumentsAt urls: [URL]) {
         guard let url = urls.first else { return }
-        let scoped = url.startAccessingSecurityScopedResource()
-        defer { if scoped { url.stopAccessingSecurityScopedResource() } }
-        guard let data = try? Data(contentsOf: url) else { return }
+        let cap = AttachmentLimits.maxFileBytes
         let contentType = UTType(filenameExtension: url.pathExtension)?.preferredMIMEType
             ?? "application/octet-stream"
-        attachments.append(PendingAttachment(
-            kind: .file, data: data, contentType: contentType, filename: url.lastPathComponent
-        ))
-        refreshAttachments()
+        let filename = url.lastPathComponent
+
+        // Reject on the declared size first, so an oversized pick costs no bytes.
+        let scopedForSize = url.startAccessingSecurityScopedResource()
+        let declared = AttachmentLimits.declaredSize(of: url)
+        if scopedForSize { url.stopAccessingSecurityScopedResource() }
+        if let declared, declared > cap {
+            showAttachmentTooLarge(cap: cap)
+            return
+        }
+
+        // Read off the main thread and bounded: the picker allows any item, and
+        // an un-materialised iCloud file blocks on a network fetch. Reading one
+        // byte past the cap is what detects a file whose declared size lied.
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let scoped = url.startAccessingSecurityScopedResource()
+            let data = AttachmentLimits.readCapped(url: url, limit: cap + 1)
+            if scoped { url.stopAccessingSecurityScopedResource() }
+
+            DispatchQueue.main.async {
+                guard let self else { return }
+                guard let data else {
+                    self.showAttachmentUnreadable()
+                    return
+                }
+                guard data.count <= cap else {
+                    self.showAttachmentTooLarge(cap: cap)
+                    return
+                }
+                self.attachments.append(PendingAttachment(
+                    kind: .file, data: data, contentType: contentType, filename: filename
+                ))
+                self.refreshAttachments()
+            }
+        }
+    }
+
+    private func showAttachmentTooLarge(cap: Int) {
+        presentAttachmentAlert(
+            "That file is too large (max \(AttachmentLimits.humanReadable(cap)))."
+        )
+    }
+
+    private func showAttachmentUnreadable() {
+        presentAttachmentAlert("That file couldn’t be read. Try a different one.")
+    }
+
+    private func presentAttachmentAlert(_ message: String) {
+        let alert = UIAlertController(
+            title: "Couldn’t attach", message: message, preferredStyle: .alert
+        )
+        alert.addAction(UIAlertAction(title: "OK", style: .default))
+        present(alert, animated: true)
     }
 }
 #endif
