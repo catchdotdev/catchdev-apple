@@ -4,5 +4,5 @@ import Foundation
 /// fields of every feedback report).
 public enum SDKInfo {
     public static let name = "catchdev-apple"
-    public static let version = "0.2.0"
+    public static let version = "0.1.0"
 }
