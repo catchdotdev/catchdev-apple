@@ -17,10 +17,18 @@ jobs:
   cocoapods:
     name: Push to CocoaPods Trunk
     runs-on: macos-15
+    # The `secrets` context is NOT available in an `if:` expression — using it
+    # there fails the whole run at startup rather than skipping the step (which
+    # is exactly what the 0.1.0 tag did). Map it into env and test that instead.
+    env:
+      TRUNK_TOKEN: ${{ secrets.COCOAPODS_TRUNK_TOKEN }}
     steps:
       - uses: actions/checkout@v4
       - name: pod trunk push
-        if: ${{ secrets.COCOAPODS_TRUNK_TOKEN != '' }}
+        if: env.TRUNK_TOKEN != ''
         env:
-          COCOAPODS_TRUNK_TOKEN: ${{ secrets.COCOAPODS_TRUNK_TOKEN }}
+          COCOAPODS_TRUNK_TOKEN: ${{ env.TRUNK_TOKEN }}
         run: pod trunk push CatchDev.podspec --allow-warnings
+      - name: Skipped
+        if: env.TRUNK_TOKEN == ''
+        run: echo "COCOAPODS_TRUNK_TOKEN not set — skipping CocoaPods publish."
