@@ -1,6 +1,6 @@
 Pod::Spec.new do |spec|
   spec.name             = 'CatchDev'
-  spec.version          = '0.2.0'
+  spec.version          = '0.1.0'
   spec.summary          = 'Shake-to-report user feedback for iOS apps, by catch.dev.'
   spec.description      = <<-DESC
     CatchDev lets your users shake their device to report a problem: it captures the

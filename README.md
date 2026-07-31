@@ -16,9 +16,8 @@ under **App → Feedback**.
 
 ## Installation
 
-> **Early access**: this repository is private during early access, so SPM resolution
-> requires repo access — contact support@catch.dev to get added. CocoaPods publishing
-> lands at public launch.
+> **Early access**: the SDK is in early access — the API may change before 1.0.
+> Questions and issues: support@catch.dev.
 
 ### Swift Package Manager (recommended)
 
