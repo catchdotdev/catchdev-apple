@@ -8,7 +8,7 @@ Pod::Spec.new do |spec|
     your catch.dev dashboard.
   DESC
   spec.homepage         = 'https://github.com/catchdotdev/catchdev-apple'
-  spec.license          = { :type => 'MIT', :file => 'LICENSE' }
+  spec.license          = { :type => 'Apache-2.0', :file => 'LICENSE' }
   spec.author           = { 'catch.dev' => 'support@catch.dev' }
   spec.source           = {
     :git => 'https://github.com/catchdotdev/catchdev-apple.git',
