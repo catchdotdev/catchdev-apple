@@ -50,20 +50,29 @@ rid=$(resolve_runtime)
 [ -n "$rid" ] || { echo "no usable iOS simulator runtime is installed" >&2; exit 1; }
 
 # Stable, reuse-by-name device per runtime (idempotent — avoids piling up simulators on a
-# persistent self-hosted runner). Older runtimes don't support newer device types, so try a
-# few oldest-first and use the first that the runtime accepts.
+# persistent self-hosted runner). Older runtimes don't support newer device types, so the
+# preferred models are tried oldest-first. After them comes every iPhone this Xcode knows,
+# newest first (`simctl list devicetypes` order), so a future runtime that has dropped all
+# the preferred models still gets a device: the runtime rejects types it doesn't support and
+# the first one it accepts wins. No model name here has to be updated when Apple retires one.
 label="${rid##*.SimRuntime.}"   # e.g. iOS-16-4
 name="catchdev-ci-$label"
 udid=$(xcrun simctl list devices | grep -F "$name (" | grep -oE '[0-9A-F-]{36}' | head -1 || true)
 
 if [ -z "$udid" ]; then
-  for dt in "iPhone 14" "iPhone 15" "iPhone 16" "iPhone SE (3rd generation)" "iPhone 13"; do
+  candidates=$(
+    printf '%s\n' "iPhone 14" "iPhone 15" "iPhone 16" "iPhone SE (3rd generation)" "iPhone 13"
+    xcrun simctl list devicetypes \
+      | sed -nE 's/^iPhone.*\((com\.apple\.CoreSimulator\.SimDeviceType\.[^)]+)\)$/\1/p'
+  )
+  while IFS= read -r dt; do
+    [ -n "$dt" ] || continue
     if udid=$(xcrun simctl create "$name" "$dt" "$rid" 2>/dev/null); then
       echo "created simulator '$dt' on $label ($udid)" >&2
       break
     fi
     udid=""
-  done
+  done <<< "$candidates"
 fi
 [ -n "$udid" ] || { echo "could not find or create an iPhone on $label" >&2; exit 1; }
 

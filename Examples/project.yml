@@ -27,6 +27,14 @@ targets:
       path: CatchDevExample/Info.plist
       properties:
         UILaunchScreen: {}
+        # Scene life cycle: required for apps built with the iOS 27 SDK (the iOS 27 runtime
+        # won't launch one without it). The window is built in SceneDelegate.
+        UIApplicationSceneManifest:
+          UIApplicationSupportsMultipleScenes: false
+          UISceneConfigurations:
+            UIWindowSceneSessionRoleApplication:
+              - UISceneConfigurationName: Default Configuration
+                UISceneDelegateClassName: $(PRODUCT_MODULE_NAME).SceneDelegate
         # Allow cleartext HTTP to localhost (in-process UI-test server / local backend).
         NSAppTransportSecurity:
           NSAllowsLocalNetworking: true

@@ -1,23 +1,18 @@
 import UIKit
 @_spi(CatchDevTesting) import CatchDev
 
-/// UIKit entry point for the example app. Starts the SDK, builds the tab/navigation UI,
-/// and — under `-CatchDevUITest` — wires the in-process mock server to a debug probe so
-/// the UI tests can assert what the SDK actually sent.
+/// UIKit entry point for the example app. Starts the SDK; the window and the tab/navigation
+/// UI are built by ``SceneDelegate`` (the app uses the scene life cycle). Under
+/// `-CatchDevUITest` it also starts the in-process mock server the UI tests send to.
 @main
 final class AppDelegate: UIResponder, UIApplicationDelegate {
-    var window: UIWindow?
-    private var debugProbe: DebugProbeView?
-
     func application(
         _ application: UIApplication,
         didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil
     ) -> Bool {
-        let isUITest = ProcessInfo.processInfo.arguments.contains("-CatchDevUITest")
-
-        // Start the SDK BEFORE building the window: this installs the view-controller
+        // Start the SDK BEFORE any scene connects: this installs the view-controller
         // tracker swizzle, so the very first screen's appearance is recorded.
-        if isUITest {
+        if ProcessInfo.processInfo.arguments.contains("-CatchDevUITest") {
             // Hermetic tests: wipe any outbox left by a previous test launch so a stale
             // queued report can't replay into this run.
             CatchDev.resetPersistenceForTesting()
@@ -32,28 +27,6 @@ final class AppDelegate: UIResponder, UIApplicationDelegate {
             CatchDev.start(apiKey: "ck_replace_me")
         }
         CatchDev.setEnvironment("development")
-
-        let window = UIWindow(frame: UIScreen.main.bounds)
-        window.rootViewController = RootTabBarController()
-        window.makeKeyAndVisible()
-        self.window = window
-
-        if isUITest {
-            let probe = DebugProbeView()
-            probe.attach(to: window)
-            probe.setMockPort(MockFeedbackServer.shared.port)
-            debugProbe = probe
-            MockFeedbackServer.shared.onRequestReceived = { [weak probe] received in
-                DispatchQueue.main.async {
-                    probe?.update(received)
-                }
-            }
-            MockFeedbackServer.shared.onAnyRequest = { [weak probe] method, path in
-                DispatchQueue.main.async {
-                    probe?.noteRequest(method: method, path: path)
-                }
-            }
-        }
         return true
     }
 }
