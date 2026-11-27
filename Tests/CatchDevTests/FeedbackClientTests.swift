@@ -153,12 +153,35 @@ final class FeedbackClientTests: XCTestCase {
         let expectation = expectation(description: "completion")
         client.send(FeedbackReport(message: "x"), configuration: config) { result in
             switch result {
-            case .success(let id): XCTAssertEqual(id, "fb_123")
+            case .success(let ack):
+                XCTAssertEqual(ack.id, "fb_123")
+                XCTAssertNil(ack.storedAttachments, "no `attachments` field — nothing to report")
             case .failure(let error): XCTFail("unexpected failure: \(error)")
             }
             expectation.fulfill()
         }
         wait(for: [expectation], timeout: 5)
+    }
+
+    /// The backend answers `attachments: <stored count>` whenever the report listed any, so
+    /// the SDK can tell "listed 1, stored 0" apart from a full delivery.
+    func testSendParsesTheStoredAttachmentCount() {
+        let session = URLSession(configuration: MockURLProtocol.sessionConfiguration())
+        MockURLProtocol.handler = { request in
+            let response = HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!
+            return (response, Data("{\"id\":\"fb_123\",\"attachments\":0}".utf8))
+        }
+        let client = FeedbackClient(session: session, boundaryProvider: { "B" })
+        let done = expectation(description: "completion")
+        client.send(FeedbackReport(message: "x"), configuration: config) { result in
+            if case .success(let ack) = result {
+                XCTAssertEqual(ack, ReportAck(id: "fb_123", storedAttachments: 0))
+            } else {
+                XCTFail("expected success, got \(result)")
+            }
+            done.fulfill()
+        }
+        wait(for: [done], timeout: 5)
     }
 
     func testSendSurfacesServerError() {
@@ -202,7 +225,7 @@ final class FeedbackClientTests: XCTestCase {
         let client = FeedbackClient(session: session, boundaryProvider: { "B" })
         let done = expectation(description: "done")
         client.send(FeedbackReport(message: "x"), configuration: config) { result in
-            if case .success(let id) = result { XCTAssertEqual(id, "fb_retry") }
+            if case .success(let ack) = result { XCTAssertEqual(ack.id, "fb_retry") }
             else { XCTFail("expected success after retry, got \(result)") }
             done.fulfill()
         }
@@ -258,7 +281,7 @@ final class FeedbackClientTests: XCTestCase {
             let client = FeedbackClient(session: session, boundaryProvider: { "B" })
             let done = expectation(description: "done-\(body)")
             client.send(FeedbackReport(message: "x"), configuration: config) { result in
-                if case .success(let id) = result { XCTAssertEqual(id, "", "body=\(body)") }
+                if case .success(let ack) = result { XCTAssertEqual(ack.id, "", "body=\(body)") }
                 else { XCTFail("expected success for 2xx, got \(result) for body=\(body)") }
                 done.fulfill()
             }

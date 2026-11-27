@@ -47,4 +47,16 @@ enum Timestamp {
     static func now() -> String {
         formatter.string(from: Date())
     }
+
+    /// Reads back a timestamp written by ``now()``. Also accepts one without fractional
+    /// seconds; `nil` for anything else.
+    static func date(from string: String) -> Date? {
+        formatter.date(from: string) ?? wholeSecondsFormatter.date(from: string)
+    }
+
+    private static let wholeSecondsFormatter: ISO8601DateFormatter = {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime]
+        return formatter
+    }()
 }

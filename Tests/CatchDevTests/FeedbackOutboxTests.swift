@@ -248,17 +248,36 @@ final class FeedbackOutboxTests: XCTestCase {
         XCTAssertNil(outbox.entry(reportId: "nope"))
     }
 
-    func testDropBlobDiscardsTheBytesButKeepsTheReport() throws {
+    // MARK: - Attachment attempts (the give-up limit's counter)
+
+    /// The counter that bounds the attachment retry lives on disk, next to its entry, so a
+    /// relaunch can neither reset it nor lose it.
+    func testAttachmentAttemptsArePersistedPerEntryAndSurviveARelaunch() throws {
         let outbox = FeedbackOutbox(directory: dir)
-        try outbox.enqueue(report(id: "a", time: "t1"), blobs: [blob(16), blob(32)])
+        try outbox.enqueue(report(id: "a", time: "t1"), blobs: [blob(16)])
+        try outbox.enqueue(report(id: "b", time: "t2"))
+        XCTAssertEqual(outbox.attachmentAttempts(reportId: "a"), 0)
 
-        outbox.dropBlob(reportId: "a", index: 1) // the server refused these bytes for good
+        XCTAssertEqual(outbox.recordAttachmentAttempt(reportId: "a"), 1)
+        XCTAssertEqual(outbox.recordAttachmentAttempt(reportId: "a"), 2)
 
-        let entry = try XCTUnwrap(outbox.entry(reportId: "a"))
-        XCTAssertEqual(entry.report.message, "hi", "the user's message survives a rejected file")
-        XCTAssertEqual(entry.blobs.map(\.index), [0], "only the refused blob is discarded")
-        XCTAssertNil(outbox.blobData(reportId: "a", index: 1))
-        XCTAssertTrue(entry.report.attachments.isEmpty, "a refused blob contributes no reference")
+        let relaunched = FeedbackOutbox(directory: dir) // a new process reading the same disk
+        XCTAssertEqual(relaunched.attachmentAttempts(reportId: "a"), 2)
+        XCTAssertEqual(relaunched.attachmentAttempts(reportId: "b"), 0, "counted per entry")
+        XCTAssertEqual(relaunched.entry(reportId: "a")?.blobs.count, 1, "the bytes are untouched")
+    }
+
+    func testAttachmentAttemptsGoWithTheirEntry() throws {
+        let outbox = FeedbackOutbox(directory: dir)
+        try outbox.enqueue(report(id: "a", time: "t1"))
+        outbox.recordAttachmentAttempt(reportId: "a")
+        outbox.remove(reportId: "a")
+        XCTAssertEqual(outbox.attachmentAttempts(reportId: "a"), 0)
+
+        // Counting an attempt for an entry that is gone must not resurrect its folder.
+        outbox.recordAttachmentAttempt(reportId: "a")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: dir.appendingPathComponent("a").path))
+        XCTAssertEqual(outbox.count, 0)
     }
 
     func testRemoveDeletesPendingBlobsToo() throws {

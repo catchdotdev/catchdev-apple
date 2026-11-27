@@ -98,11 +98,16 @@ CatchDev.areas = ["Checkout", "Search", "Profile", "Notifications", "Billing"]
 CatchDev.presentReporter()              // open the reporter manually (e.g. a button)
 CatchDev.isDebugLoggingEnabled = true   // print SDK diagnostics while integrating
 
-// Confirm delivery / instrument analytics (Swift only). Called on the main thread.
+// Confirm delivery / instrument analytics (Swift only). Called on the main thread,
+// once per submission, with its final outcome.
 CatchDev.onFeedbackSent = { result in
     switch result {
-    case .success(let id): print("sent:", id)
-    case .failure(let error): print("failed:", error)
+    case .success(let id):
+        print("sent:", id)                        // the report and every attachment arrived
+    case .failure(let error as CatchDevAttachmentsNotDelivered):
+        print("sent without attachments:", error.reportId, error.missingCount)
+    case .failure(let error):
+        print("failed:", error)                   // the report was not delivered
     }
 }
 ```
@@ -165,10 +170,25 @@ The outbox is drained automatically when:
 
 Delivered reports are removed; a report the server *rejects* (e.g. a bad key) is dropped
 rather than retried forever; a report that can't be sent because the device is offline
-stays queued. `onFeedbackSent` fires when a report is actually delivered. The outbox is
-bounded, so a long offline period can't grow it without limit. (This is an in-process
-outbox — it uploads while the app is running, not while suspended/terminated, which keeps
-the SDK self-contained with no host AppDelegate wiring required.)
+stays queued. The outbox is bounded, so a long offline period can't grow it without limit.
+(This is an in-process outbox — it uploads while the app is running, not while
+suspended/terminated, which keeps the SDK self-contained with no host AppDelegate wiring
+required.)
+
+Attachments (screenshots, recordings, files) upload straight to storage. If an attachment
+upload fails — for any reason, including a 4xx from storage — the report is still sent, so
+it appears in the dashboard right away, and the attachment stays queued. Each drain of the
+outbox retries it and re-sends the report under the same `reportId`; the server keeps the
+attachments it already has and adds the rest. The SDK gives up on an attachment only after
+at least 5 failed attempts that reached the server **and** 7 days since the report was
+submitted. It then logs a line saying so (even with debug logging off) and removes the
+report from the outbox.
+
+`onFeedbackSent` fires once per submission, with its final outcome: `.success(id)` when the
+report and every attachment arrived, or
+`.failure(CatchDevAttachmentsNotDelivered)` — carrying the report's `reportId` and how many
+attachments are missing — when the SDK gave up on attachments. A submission still waiting in
+the outbox has no outcome yet.
 
 ## Privacy
 

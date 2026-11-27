@@ -76,6 +76,7 @@ struct OutboxEntry {
 /// <outbox>/<reportId>/blobs/<n>.bin    # pending attachment bytes (gone once uploaded)
 /// <outbox>/<reportId>/blobs/<n>.json   # that blob's descriptor + its receipt, once uploaded
 /// <outbox>/<reportId>/screenshot.jpg   # legacy inline screenshot (`imageData`), if any
+/// <outbox>/<reportId>/attachment-attempts.json  # attempts that left attachments missing
 /// ```
 ///
 /// Foundation-only and directory-injectable for testing. Every method is thread-safe.
@@ -289,7 +290,7 @@ final class FeedbackOutbox {
     /// other outbox caller (including the main thread, which is inside `enqueue` when the user
     /// taps Send) for the length of that read is exactly the kind of stall an embedded SDK may
     /// not impose. It is safe because a blob's bytes are only ever mutated by the one delivery
-    /// that holds the entry (`markUploaded` / `dropBlob`), and the caps never evict a held entry
+    /// that holds the entry (`markUploaded` / `remove`), and the caps never evict a held entry
     /// — and a `nil` from a racing delete is already the caller's "no bytes, no receipt ⇒ retry
     /// later" path, never a silent drop.
     func blobData(reportId: String, index: Int) -> Data? {
@@ -339,19 +340,59 @@ final class FeedbackOutbox {
         try? fileManager.removeItem(at: blobs.appendingPathComponent("\(blobIndex).bin"))
     }
 
-    /// Discard one blob the server refused for good (413 too large, unsupported type) while
-    /// KEEPING the entry. The design's permanent-rejection rule is about the report POST;
-    /// applying it to an attachment hop would destroy the user's typed message — and every
-    /// attachment that already uploaded — over one oversized file. Dropping just the bytes
-    /// stops the pointless retry and lets the rest of the report be delivered.
-    func dropBlob(reportId: String, index: Int) {
+    // MARK: - Attachment attempts
+
+    /// How many delivery attempts of this entry reached the server — the report POST got a
+    /// 2xx — but still left attachments missing. `0` for an entry with none, or no entry.
+    ///
+    /// This is what bounds the attachment retry: the deliverer gives up on an entry's missing
+    /// attachments only after enough of these (see ``CatchDev/AttachmentRetryLimits``). It is
+    /// on disk, next to the entry, so relaunching the app cannot reset it.
+    func attachmentAttempts(reportId: String) -> Int {
         lock.lock(); defer { lock.unlock() }
-        let blobs = blobsDirectory(for: reportId)
-        try? fileManager.removeItem(at: blobs.appendingPathComponent("\(index).bin"))
-        try? fileManager.removeItem(at: blobs.appendingPathComponent("\(index).json"))
+        return attachmentAttemptsLocked(reportId: reportId)
     }
 
-    /// Remove a delivered (or permanently rejected) entry and everything under it.
+    /// Count one more attempt that left attachments missing, and return the new total.
+    ///
+    /// A failed write (disk full) is deliberately not an error: the count simply does not
+    /// advance on disk, which can only make the SDK retry longer, never give up early. An
+    /// entry that is no longer on disk gets no file — writing one would leave a folder with no
+    /// `report.json` behind, for the reaper to find.
+    @discardableResult
+    func recordAttachmentAttempt(reportId: String) -> Int {
+        lock.lock(); defer { lock.unlock() }
+        let entry = directory.appendingPathComponent(reportId, isDirectory: true)
+        let attempts = attachmentAttemptsLocked(reportId: reportId) + 1
+        guard fileManager.fileExists(atPath: entry.appendingPathComponent("report.json").path) else {
+            return attempts
+        }
+        if let data = try? JSONEncoder().encode(AttachmentAttempts(count: attempts)) {
+            try? writeFile(data, entry.appendingPathComponent(Self.attachmentAttemptsFile))
+        }
+        return attempts
+    }
+
+    /// On-disk shape of `attachment-attempts.json`.
+    private struct AttachmentAttempts: Codable {
+        let count: Int
+    }
+
+    private static let attachmentAttemptsFile = "attachment-attempts.json"
+
+    private func attachmentAttemptsLocked(reportId: String) -> Int {
+        let url = directory
+            .appendingPathComponent(reportId, isDirectory: true)
+            .appendingPathComponent(Self.attachmentAttemptsFile)
+        guard
+            let data = try? Data(contentsOf: url),
+            let attempts = try? JSONDecoder().decode(AttachmentAttempts.self, from: data)
+        else { return 0 }
+        return max(0, attempts.count)
+    }
+
+    /// Remove an entry and everything under it: delivered, permanently rejected, or given up on
+    /// once its attachments ran out of retries.
     func remove(reportId: String) {
         lock.lock(); defer { lock.unlock() }
         try? fileManager.removeItem(at: directory.appendingPathComponent(reportId, isDirectory: true))

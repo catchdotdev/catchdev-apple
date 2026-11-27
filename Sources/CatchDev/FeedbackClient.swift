@@ -1,5 +1,16 @@
 import Foundation
 
+/// What the server said when it accepted a report.
+struct ReportAck: Equatable {
+    /// The server's id for the report — empty when the body carried none.
+    let id: String
+    /// How many of the report's attachment references the server found in R2 and stored —
+    /// counted across every POST of the report, because a replay under the same `reportId`
+    /// keeps what earlier POSTs stored. `nil` when the response doesn't say, which is what a
+    /// backend from before the field existed sends.
+    let storedAttachments: Int?
+}
+
 /// Builds and sends the `multipart/form-data` request for a feedback report.
 /// Foundation-only (URLSession), so it compiles and unit-tests on any platform.
 final class FeedbackClient {
@@ -60,7 +71,7 @@ final class FeedbackClient {
     func send(
         _ report: FeedbackReport,
         configuration: Configuration,
-        completion: @escaping (Result<String, Error>) -> Void
+        completion: @escaping (Result<ReportAck, Error>) -> Void
     ) {
         let request = makeRequest(report: report, configuration: configuration)
         perform(request, retriesRemaining: 1, completion: completion)
@@ -69,7 +80,7 @@ final class FeedbackClient {
     private func perform(
         _ request: URLRequest,
         retriesRemaining: Int,
-        completion: @escaping (Result<String, Error>) -> Void
+        completion: @escaping (Result<ReportAck, Error>) -> Void
     ) {
         let task = session.dataTask(with: request) { [weak self] data, response, error in
             if let error = error {
@@ -87,13 +98,11 @@ final class FeedbackClient {
                 return
             }
 
-            var id = ""
-            if let data = data,
-               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-               let value = json["id"] as? String {
-                id = value
-            }
-            completion(.success(id))
+            let json = data.flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }
+            completion(.success(ReportAck(
+                id: json?["id"] as? String ?? "",
+                storedAttachments: json?["attachments"] as? Int
+            )))
         }
         task.resume()
     }

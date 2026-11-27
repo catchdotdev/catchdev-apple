@@ -24,12 +24,62 @@ public final class CatchDev: NSObject {
     /// state for this, never an error, and `onFeedbackSent` stays silent until it is
     /// actually `delivered` by a later flush.
     enum SubmissionOutcome {
+        /// The report and every attachment reached the server.
         case delivered(reportId: String)
+        /// Safely on disk; nothing reached the server yet.
         case queued(reportId: String)
+        /// The report reached the server, but some attachments did not. They stay in the
+        /// outbox and the next flush retries them; `onFeedbackSent` waits for that outcome.
+        case attachmentsPending(reportId: String)
     }
 
-    /// Why a delivery attempt failed. The distinction is what makes the outbox correct:
-    /// a permanent rejection drops the entry, a retryable failure keeps it for the next flush.
+    /// How one delivery attempt of an outbox entry ended.
+    enum DeliveryOutcome {
+        /// The report and every attachment reached the server. The entry is gone.
+        case delivered(id: String)
+        /// The report reached the server but some attachments did not. The entry stays, and
+        /// the next flush uploads them and re-POSTs the report under the same `reportId`.
+        case attachmentsPending(id: String)
+        /// The report reached the server, but its missing attachments ran out of retries, so
+        /// the SDK gave up on them. The entry is gone.
+        case attachmentsAbandoned(CatchDevAttachmentsNotDelivered)
+        /// The server refused the report for good. The entry is gone.
+        case rejected(Error)
+        /// The report didn't reach the server (offline, 5xx, rate-limited). The entry stays.
+        case deferred(Error)
+    }
+
+    /// When the SDK stops retrying attachments that won't upload.
+    ///
+    /// **Shared verbatim with the Android SDK — keep the two identical.** Any failed attachment
+    /// upload (a 403 from R2, a refused mint, a timeout) keeps the attachment in the outbox, and
+    /// every flush retries it. The SDK gives up on an entry's missing attachments only once
+    /// BOTH limits are reached:
+    ///
+    /// - `maxAttempts`: delivery attempts that reached the server (the report POST got a 2xx)
+    ///   yet still left attachments missing. Attempts that never reached the server don't
+    ///   count, so time spent offline can't use up the retries.
+    /// - `maxAge`: time since the user submitted the report (its own `time`).
+    ///
+    /// Requiring both means neither a short R2 outage nor a burst of flushes (launch, the
+    /// reachability callback and the foreground notification can all fire within a second) can
+    /// cost a screenshot, and an app that is rarely opened still gets `maxAttempts` real tries.
+    struct AttachmentRetryLimits {
+        var maxAttempts: Int
+        var maxAge: TimeInterval
+
+        static let standard = AttachmentRetryLimits(maxAttempts: 5, maxAge: 7 * 24 * 60 * 60)
+    }
+
+    /// One attachment whose upload failed in this attempt: it stays pending for the next one.
+    struct AttachmentFailure {
+        let blob: OutboxBlob
+        let error: Error
+    }
+
+    /// Why a report POST failed. The distinction is what makes the outbox correct: a permanent
+    /// rejection drops the entry, a retryable failure keeps it for the next flush. It applies
+    /// to the report POST only — an attachment upload is retried whatever its failure.
     enum DeliveryFailure: Error {
         /// The server rejected it for good (bad key, payload too large, …) — retrying is
         /// pointless, so the entry is deleted.
@@ -72,6 +122,8 @@ public final class CatchDev: NSObject {
     private let outbox: FeedbackOutbox?
     /// Whether to watch connectivity and auto-flush on reconnect (off in unit tests).
     private let reachabilityEnabled: Bool
+    /// When to stop retrying attachments that won't upload.
+    private let attachmentRetryLimits: AttachmentRetryLimits
 
     /// Serial queue for the SDK's own outbox work: the whole flush drain, and every read/write a
     /// delivery makes (reading a blob's 25–40 MB back off disk, recording an upload's receipt,
@@ -127,6 +179,7 @@ public final class CatchDev: NSObject {
         self.uploader = AttachmentUploader()
         self.outbox = FeedbackOutbox.defaultDirectory().map { FeedbackOutbox(directory: $0) }
         self.reachabilityEnabled = true
+        self.attachmentRetryLimits = .standard
         super.init()
     }
 
@@ -138,12 +191,14 @@ public final class CatchDev: NSObject {
         client: FeedbackClient,
         uploader: AttachmentUploader = AttachmentUploader(),
         outbox: FeedbackOutbox? = nil,
-        monitorReachability: Bool = false
+        monitorReachability: Bool = false,
+        attachmentRetryLimits: AttachmentRetryLimits = .standard
     ) {
         self.client = client
         self.uploader = uploader
         self.outbox = outbox
         self.reachabilityEnabled = monitorReachability
+        self.attachmentRetryLimits = attachmentRetryLimits
         super.init()
     }
 
@@ -288,9 +343,20 @@ public final class CatchDev: NSObject {
         set { shared.withLock { $0.debugLogging = newValue } }
     }
 
-    /// Invoked on the main thread after every submission with the server report id
-    /// on success, or the error on failure. Lets integrators confirm delivery and
-    /// instrument analytics. (Swift only.)
+    /// Invoked on the main thread once per submission, with its final outcome. Lets
+    /// integrators confirm delivery and instrument analytics. (Swift only.)
+    ///
+    /// - `.success(id)`: the report and every attachment reached catch.dev; `id` is the
+    ///   server's id for the report.
+    /// - `.failure(CatchDevAttachmentsNotDelivered)`: the report reached catch.dev (its
+    ///   `reportId` is in the error), but some attachments never uploaded before the retry
+    ///   limits ran out.
+    /// - `.failure(CatchDevError)`: the report was not delivered (rejected by the server, or
+    ///   the SDK was not started).
+    ///
+    /// A submission that is still waiting in the outbox — offline, or with attachments still
+    /// retrying — has no outcome yet, so the callback fires later, from the flush that
+    /// settles it.
     public static var onFeedbackSent: ((Result<String, Error>) -> Void)? {
         get { shared.onFeedbackSent }
         set { shared.onFeedbackSent = newValue }
@@ -329,8 +395,9 @@ public final class CatchDev: NSObject {
     /// the attachments and POST the report. The same `reportId` is replayed on the next
     /// flush and the server dedupes on it, so a replay can never duplicate a report.
     ///
-    /// Offline, the completion reports `.queued` (a success-style state), not an error;
-    /// `onFeedbackSent` fires only on actual delivery.
+    /// Offline, the completion reports `.queued` (a success-style state), not an error. When
+    /// the report lands but an attachment upload fails, it reports `.attachmentsPending` and the
+    /// attachment stays queued. `onFeedbackSent` fires only with a submission's final outcome.
     ///
     /// **Threading.** The report is assembled AND persisted on the calling thread — see the
     /// "persist first, synchronously" comment below for why the persist may not be deferred to a
@@ -470,18 +537,26 @@ public final class CatchDev: NSObject {
             self.deliver(
                 report: deliveryReport, blobs: blobs, loadBlob: loadBlob,
                 outbox: durableOutbox, configuration: configuration
-            ) { [weak self] result in
+            ) { [weak self] outcome in
                 guard let self else { return }
                 if holding { self.endDelivery(of: reportId) }
-                switch result {
-                case .success(let id):
+                switch outcome {
+                case .delivered(let id):
                     self.notifyFeedbackSent(.success(id))
                     completion(.success(.delivered(reportId: id)))
-                case .failure(.permanent(let error)):
+                case .attachmentsPending(let id):
+                    // The report is on the server; its missing attachments stay in the outbox
+                    // for the next flush. No onFeedbackSent yet: that waits for the outcome.
+                    completion(.success(.attachmentsPending(reportId: id)))
+                case .attachmentsAbandoned(let error):
+                    // Only reachable without a durable entry (nothing could retry them).
+                    self.notifyFeedbackSent(.failure(error))
+                    completion(.failure(error))
+                case .rejected(let error):
                     // 4. The server rejected it for good; the entry is already dropped.
                     self.notifyFeedbackSent(.failure(error))
                     completion(.failure(error))
-                case .failure(.retryable(let error)):
+                case .deferred(let error):
                     // 5. Offline: the entry stays on disk and is delivered on reconnect. Report
                     // it QUEUED (a success state) so the reporter dismisses normally instead of
                     // showing "Couldn't send report"; onFeedbackSent fires when it lands.
@@ -498,8 +573,17 @@ public final class CatchDev: NSObject {
     }
 
     /// Deliver one submission: upload every still-pending attachment (persisting each
-    /// reference as it lands), then POST the report. The durable entry is removed ONLY
-    /// after the backend acks the report — or permanently rejects it.
+    /// reference as it lands), then POST the report — even when an upload failed, so the
+    /// user's report reaches the dashboard while R2 is broken. The durable entry is removed
+    /// only once the server has the report AND every attachment, once it refuses the report
+    /// for good, or once the missing attachments run out of retries
+    /// (``settleMissingAttachments(report:id:failures:unconfirmed:outbox:)``).
+    ///
+    /// **A retry relies on the server's dedupe.** The next attempt mints fresh upload URLs for
+    /// whatever is still pending (the server never hands URLs back, and a presigned URL expires
+    /// after an hour anyway), uploads those bytes, and re-POSTs the report under the same
+    /// `reportId`, listing every reference. The server keeps the existing row and the
+    /// attachments it already stored, and checks only the references it doesn't have yet.
     ///
     /// **Callers must hold the entry's delivery claim** (``beginDelivery(of:)``) for the whole
     /// call: this reads and rewrites on-disk state that a second, concurrent delivery of the
@@ -514,33 +598,50 @@ public final class CatchDev: NSObject {
         loadBlob: @escaping (OutboxBlob) -> Data?,
         outbox: FeedbackOutbox?,
         configuration: Configuration,
-        completion: @escaping (Result<String, DeliveryFailure>) -> Void
+        completion: @escaping (DeliveryOutcome) -> Void
     ) {
         uploadBlobs(
-            report: report, blobs: blobs, index: 0, loadBlob: loadBlob,
+            report: report, blobs: blobs, index: 0, failures: [], loadBlob: loadBlob,
             outbox: outbox, configuration: configuration
         ) { [weak self] result in
             guard let self else { return }
             switch result {
-            case .failure(let failure):
-                // An attachment hop only ever fails RETRYABLY (a permanent rejection drops
-                // that one blob inside `uploadBlobs` and delivery continues), so the entry
-                // always survives to be retried — never deleted over an attachment.
-                completion(.failure(failure))
-            case .success(let ready):
+            case .failure(let error):
+                // A blob's bytes vanished with no receipt (see `uploadBlobs`). Never POST
+                // without proof of what landed; the entry stays for a later attempt.
+                completion(.deferred(error))
+            case .success(let pass):
+                let ready = pass.report
                 self.client.send(ready, configuration: configuration) { [weak self] sendResult in
                     guard let self else { return }
                     // Back onto the outbox queue: deleting the entry is disk IO, and this
                     // callback is running on the URLSession's delegate thread.
                     self.outboxQueue.async {
                         switch sendResult {
-                        case .success(let id):
-                            outbox?.remove(reportId: report.reportId) // ack-then-delete
-                            completion(.success(id.isEmpty ? report.reportId : id))
+                        case .success(let ack):
+                            let id = ack.id.isEmpty ? report.reportId : ack.id
+                            // References the server could not find in R2 (its HEAD came back
+                            // empty or failed): the upload "succeeded", yet the attachment isn't
+                            // stored. A server too old to send the count is taken at its word.
+                            let listed = ready.attachments.count
+                            let unconfirmed = max(0, listed - (ack.storedAttachments ?? listed))
+                            if pass.failures.isEmpty, unconfirmed == 0 {
+                                outbox?.remove(reportId: report.reportId) // ack-then-delete
+                                completion(.delivered(id: id))
+                            } else {
+                                completion(self.settleMissingAttachments(
+                                    report: report, id: id, failures: pass.failures,
+                                    unconfirmed: unconfirmed, outbox: outbox
+                                ))
+                            }
                         case .failure(let error):
-                            let failure = DeliveryFailure(error)
-                            if case .permanent = failure { outbox?.remove(reportId: report.reportId) }
-                            completion(.failure(failure))
+                            switch DeliveryFailure(error) {
+                            case .permanent(let error):
+                                outbox?.remove(reportId: report.reportId)
+                                completion(.rejected(error))
+                            case .retryable(let error):
+                                completion(.deferred(error))
+                            }
                         }
                     }
                 }
@@ -548,9 +649,62 @@ public final class CatchDev: NSObject {
         }
     }
 
+    /// The report reached the server, but attachments did not: `failures` never uploaded, and
+    /// `unconfirmed` uploaded references the server could not find. Count the attempt, then
+    /// either keep the entry for the next flush or — once both ``AttachmentRetryLimits`` are
+    /// reached — give up on those attachments, log it even with debug logging off, and drop
+    /// the entry.
+    ///
+    /// Without a durable entry there is nothing to retry from, so the attempt is final.
+    private func settleMissingAttachments(
+        report: FeedbackReport,
+        id: String,
+        failures: [AttachmentFailure],
+        unconfirmed: Int,
+        outbox: FeedbackOutbox?
+    ) -> DeliveryOutcome {
+        let missing = failures.count + unconfirmed
+        var attempts = 1
+        if let outbox {
+            attempts = outbox.recordAttachmentAttempt(reportId: report.reportId)
+            // An unreadable `time` counts as old enough, so the attempt limit alone bounds it.
+            let age = Timestamp.date(from: report.time).map { Date().timeIntervalSince($0) } ?? .infinity
+            guard attempts >= attachmentRetryLimits.maxAttempts, age >= attachmentRetryLimits.maxAge else {
+                log("report \(id) reached the server; \(missing) attachment(s) still missing after attempt \(attempts) — kept for the next flush")
+                return .attachmentsPending(id: id)
+            }
+            outbox.remove(reportId: report.reportId)
+        }
+        for failure in failures {
+            warn(
+                "giving up on attachment \(failure.blob.index) (\(failure.blob.kind.rawValue), "
+                    + "\(failure.blob.size) bytes) of report \(id) after \(attempts) failed attempt(s); "
+                    + "last error: \(failure.error)"
+            )
+        }
+        if unconfirmed > 0 {
+            warn(
+                "giving up on \(unconfirmed) attachment(s) of report \(id) that uploaded but that "
+                    + "the server could not find in storage, after \(attempts) attempt(s)"
+            )
+        }
+        return .attachmentsAbandoned(CatchDevAttachmentsNotDelivered(
+            reportId: id, missingCount: missing, underlyingError: failures.last?.error
+        ))
+    }
+
+    /// One pass over an entry's pending blobs: the report carrying every reference that has
+    /// landed so far, and the blobs whose upload failed this time.
+    struct UploadPass {
+        let report: FeedbackReport
+        let failures: [AttachmentFailure]
+    }
+
     /// Upload the pending attachment blobs one at a time, appending each returned reference
     /// to the report (and persisting it) as soon as it lands — so a replay never re-uploads
-    /// bytes that already reached R2.
+    /// bytes that already reached R2. A failed upload, whatever the failure, is recorded and
+    /// the pass moves on to the next blob; the failed blob's bytes stay on disk for the next
+    /// attempt.
     ///
     /// Runs on ``outboxQueue`` — including every recursive step, which is why the uploader's
     /// completion hops back onto it before reading the next blob or writing a receipt.
@@ -558,13 +712,14 @@ public final class CatchDev: NSObject {
         report: FeedbackReport,
         blobs: [OutboxBlob],
         index: Int,
+        failures: [AttachmentFailure],
         loadBlob: @escaping (OutboxBlob) -> Data?,
         outbox: FeedbackOutbox?,
         configuration: Configuration,
-        completion: @escaping (Result<FeedbackReport, DeliveryFailure>) -> Void
+        completion: @escaping (Result<UploadPass, Error>) -> Void
     ) {
         guard index < blobs.count else {
-            completion(.success(report))
+            completion(.success(UploadPass(report: report, failures: failures)))
             return
         }
         let blob = blobs[index]
@@ -581,13 +736,13 @@ public final class CatchDev: NSObject {
                 let receipt = outbox.uploadedAttachment(reportId: report.reportId, index: blob.index)
             else {
                 log("blob \(blob.index) of \(report.reportId) vanished with no receipt — retrying later")
-                completion(.failure(.retryable(CatchDevError.transport(OutboxError.blobMissing))))
+                completion(.failure(CatchDevError.transport(OutboxError.blobMissing)))
                 return
             }
             var next = report
             if !next.attachments.contains(receipt) { next.attachments.append(receipt) }
             uploadBlobs(
-                report: next, blobs: blobs, index: index + 1, loadBlob: loadBlob,
+                report: next, blobs: blobs, index: index + 1, failures: failures, loadBlob: loadBlob,
                 outbox: outbox, configuration: configuration, completion: completion
             )
             return
@@ -604,23 +759,16 @@ public final class CatchDev: NSObject {
             self.outboxQueue.async {
                 switch result {
                 case .failure(let error):
-                    let failure = DeliveryFailure(error)
-                    guard case .permanent = failure else {
-                        // Offline / 5xx / rate-limited — keep the entry AND this blob for the
-                        // next flush.
-                        completion(.failure(failure))
-                        return
-                    }
-                    // The server refused THESE BYTES for good (413 too large, unsupported type).
-                    // Drop just this attachment and deliver the rest: the permanent-rejection rule
-                    // is about the report POST, and applying it to an attachment hop would destroy
-                    // the user's typed message — plus every attachment that already uploaded —
-                    // over one oversized file, identically on every retry.
-                    self.log("attachment \(blob.index) permanently rejected (\(error)) — dropped")
-                    outbox?.dropBlob(reportId: report.reportId, index: blob.index)
+                    // Kept for the next attempt, whatever the failure — a 4xx included. R2
+                    // answering 403 (a bucket that is misconfigured or not enabled) is exactly the
+                    // outage this retry exists for: treating it as permanent turned every R2
+                    // problem into silent screenshot loss. `AttachmentRetryLimits` bounds it.
+                    self.log("attachment \(blob.index) of \(report.reportId) failed to upload (\(error)) — kept for retry")
                     self.uploadBlobs(
-                        report: report, blobs: blobs, index: index + 1, loadBlob: loadBlob,
-                        outbox: outbox, configuration: configuration, completion: completion
+                        report: report, blobs: blobs, index: index + 1,
+                        failures: failures + [AttachmentFailure(blob: blob, error: error)],
+                        loadBlob: loadBlob, outbox: outbox, configuration: configuration,
+                        completion: completion
                     )
                 case .success(let attachment):
                     outbox?.markUploaded(
@@ -629,8 +777,9 @@ public final class CatchDev: NSObject {
                     var next = report
                     next.attachments.append(attachment)
                     self.uploadBlobs(
-                        report: next, blobs: blobs, index: index + 1, loadBlob: loadBlob,
-                        outbox: outbox, configuration: configuration, completion: completion
+                        report: next, blobs: blobs, index: index + 1, failures: failures,
+                        loadBlob: loadBlob, outbox: outbox, configuration: configuration,
+                        completion: completion
                     )
                 }
             }
@@ -639,8 +788,9 @@ public final class CatchDev: NSObject {
 
     /// Drain the outbox, oldest first, delivering each queued entry (uploading any
     /// attachment bytes it still carries, then posting the report). Delivered and
-    /// permanently-rejected entries are removed; on a transport failure (still offline) it
-    /// stops and leaves the rest queued.
+    /// permanently-rejected entries are removed; an entry whose report landed but whose
+    /// attachments didn't stays for the next flush, and the drain moves on; on a transport
+    /// failure (still offline) it stops and leaves the rest queued.
     ///
     /// Two latches keep this correct: `isFlushing` serializes flush-vs-flush (launch,
     /// reconnect, foreground can all fire at once), and the per-entry delivery claim
@@ -713,17 +863,24 @@ public final class CatchDev: NSObject {
             loadBlob: { blob in outbox.blobData(reportId: reportId, index: blob.index) },
             outbox: outbox,
             configuration: configuration
-        ) { [weak self] result in
+        ) { [weak self] outcome in
             guard let self else { return }
             self.endDelivery(of: reportId)
-            switch result {
-            case .success(let id):
+            switch outcome {
+            case .delivered(let id):
                 self.notifyFeedbackSent(.success(id))
                 advance()
-            case .failure(.permanent(let error)):
+            case .attachmentsPending:
+                // The server took the report, so it is reachable: keep draining. This entry's
+                // missing attachments wait for the next flush.
+                advance()
+            case .attachmentsAbandoned(let error):
                 self.notifyFeedbackSent(.failure(error)) // the entry is already dropped
                 advance()
-            case .failure(.retryable):
+            case .rejected(let error):
+                self.notifyFeedbackSent(.failure(error)) // the entry is already dropped
+                advance()
+            case .deferred:
                 // Still offline — stop and keep this and the remaining entries queued.
                 self.withLock { $0.isFlushing = false }
             }
@@ -771,6 +928,10 @@ public final class CatchDev: NSObject {
         withLock { $0.pathMonitor = monitor }
     }
 
+    /// Whether a flush is draining the outbox right now. A `flushPending()` call made while one
+    /// is still running is ignored, so tests wait for this to clear before flushing again.
+    var isFlushInProgress: Bool { withLock { $0.isFlushing } }
+
     /// Whether the device currently has no satisfied network path, per the outbox's reachability
     /// monitor. Used by the reporter to tell "you're offline" apart from "the server was briefly
     /// unreachable" on the queued overlay. Defaults to `false` (online) when reachability isn't
@@ -804,6 +965,12 @@ public final class CatchDev: NSObject {
     func log(_ message: @autoclosure () -> String) {
         guard withLock({ $0.debugLogging }) else { return }
         print("[CatchDev] \(message())")
+    }
+
+    /// Logged whether or not debug logging is on. Reserved for the SDK giving up on something
+    /// the user submitted, which must never happen silently.
+    func warn(_ message: String) {
+        NSLog("[CatchDev] %@", message)
     }
 
     @discardableResult

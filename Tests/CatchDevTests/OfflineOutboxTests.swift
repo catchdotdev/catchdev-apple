@@ -35,15 +35,45 @@ final class OfflineOutboxTests: XCTestCase {
         return FeedbackOutbox(directory: dir, maxEntries: maxEntries, maxBytes: maxBytes)
     }
 
-    private func makeSDK(outbox: FeedbackOutbox) -> CatchDev {
+    private func makeSDK(
+        outbox: FeedbackOutbox,
+        limits: CatchDev.AttachmentRetryLimits = .standard
+    ) -> CatchDev {
         let session = URLSession(configuration: MockURLProtocol.sessionConfiguration())
         let sdk = CatchDev(
             client: FeedbackClient(session: session, boundaryProvider: { "B" }),
             uploader: AttachmentUploader(session: session),
-            outbox: outbox
+            outbox: outbox,
+            attachmentRetryLimits: limits
         )
         sdk.configure(apiKey: "ck", endpoint: endpoint)
         return sdk
+    }
+
+    /// Spin the main run loop until `condition` holds — for flushes that end without firing
+    /// `onFeedbackSent` (nothing to wait on but the state they leave behind).
+    private func waitUntil(
+        _ description: String, timeout: TimeInterval = 5, _ condition: () -> Bool
+    ) {
+        let deadline = Date().addingTimeInterval(timeout)
+        while !condition(), Date() < deadline {
+            RunLoop.current.run(until: Date().addingTimeInterval(0.01))
+        }
+        XCTAssertTrue(condition(), "timed out waiting until \(description)")
+    }
+
+    /// Run one flush to completion. Waiting for the flush to be fully over (not just for its
+    /// POST) matters: a `flushPending()` issued while one is still finishing is ignored.
+    private func flushAndWait(_ sdk: CatchDev, until description: String, _ condition: () -> Bool) {
+        sdk.flushPending()
+        waitUntil(description) { condition() && !sdk.isFlushInProgress }
+    }
+
+    /// The `time` a report submitted `seconds` ago carries.
+    private static func timestamp(secondsAgo seconds: TimeInterval) -> String {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return formatter.string(from: Date().addingTimeInterval(-seconds))
     }
 
     private func screenshotBlob(_ bytes: Int = 64) -> PendingBlob {
@@ -256,10 +286,11 @@ final class OfflineOutboxTests: XCTestCase {
         XCTAssertEqual(outbox.count, 0, "a permanently rejected report must not be retried forever")
     }
 
-    /// The permanent-rejection rule is about the REPORT POST. An attachment the server refuses
-    /// for good (the backend 413s a recording over its per-kind cap) must cost the user that
-    /// one file — not the typed message and not the attachments that already uploaded.
-    func testAnAttachmentRejectedForGoodIsDroppedAndTheReportIsStillDelivered() throws {
+    /// The permanent-rejection rule is about the REPORT POST. An attachment hop that fails —
+    /// even with a 4xx, here the backend refusing to mint a URL for a recording over its cap —
+    /// never costs the user the typed message or the attachments that DID upload, and the
+    /// failed one is kept for a retry rather than dropped (only the retry limits drop it).
+    func testAnAttachmentTheServerRefusesIsKeptForRetryAndTheReportStillLands() throws {
         let outbox = tempOutbox()
         let sdk = makeSDK(outbox: outbox)
         stub.rejectMintOver = 512 // the backend's per-kind byte cap
@@ -268,8 +299,8 @@ final class OfflineOutboxTests: XCTestCase {
             sdk, message: "video is broken",
             blobs: [screenshotBlob(64), recordingBlob(4096)] // the recording blows the cap
         )
-        guard case .delivered = outcome else {
-            return XCTFail("one oversized attachment must not fail the whole report, got \(outcome)")
+        guard case .attachmentsPending = outcome else {
+            return XCTFail("the report lands and the refused attachment stays pending, got \(outcome)")
         }
 
         XCTAssertEqual(stub.putCount, 1, "only the accepted attachment reaches R2")
@@ -278,24 +309,28 @@ final class OfflineOutboxTests: XCTestCase {
         XCTAssertTrue(body.contains("name=\"message\"\r\n\r\nvideo is broken"), "the message survives")
         XCTAssertEqual(
             try Self.attachmentCount(in: body), 1,
-            "the delivered report keeps the screenshot that DID upload"
+            "the posted report carries the screenshot that DID upload"
         )
-        XCTAssertEqual(outbox.count, 0, "delivered — nothing is left to retry forever")
+        let reportId = try XCTUnwrap(Self.field("reportId", in: body))
+        let entry = try XCTUnwrap(outbox.entry(reportId: reportId), "kept: an attachment is missing")
+        XCTAssertEqual(entry.blobs.map(\.index), [1], "the refused recording is kept, not dropped")
+        XCTAssertEqual(outbox.attachmentAttempts(reportId: reportId), 1)
     }
 
-    /// 408 / 429 sit in the 4xx range but are transient by definition — the request was fine,
-    /// the server just could not take it now. Dropping the report over one would be a bug.
-    func testARateLimitedAttachmentUploadKeepsTheWholeEntryQueued() throws {
+    /// A 429 on the mint: the report itself still lands, and the attachment's bytes stay on
+    /// disk for the next flush.
+    func testARateLimitedAttachmentUploadKeepsTheAttachmentQueued() throws {
         let outbox = tempOutbox()
         let sdk = makeSDK(outbox: outbox)
         stub.mintStatus = 429 // rate limited
 
         let outcome = try submit(sdk, blobs: [screenshotBlob()])
-        guard case .queued(let reportId) = outcome else {
-            return XCTFail("a 429 must be retryable (queued), got \(outcome)")
+        guard case .attachmentsPending = outcome else {
+            return XCTFail("a 429 must keep the attachment pending, got \(outcome)")
         }
-        XCTAssertEqual(stub.reportBodies.count, 0, "nothing was posted")
-        XCTAssertEqual(outbox.count, 1, "a rate-limited upload must not drop the report")
+        XCTAssertEqual(stub.reportBodies.count, 1, "the report itself was posted")
+        let reportId = try XCTUnwrap(Self.field("reportId", in: XCTUnwrap(stub.reportBodies.first)))
+        XCTAssertEqual(outbox.count, 1, "a rate-limited upload must not drop the attachment")
         XCTAssertEqual(
             outbox.blobData(reportId: reportId, index: 0)?.count, 64,
             "the attachment's bytes are kept for the retry"
@@ -458,6 +493,225 @@ final class OfflineOutboxTests: XCTestCase {
         XCTAssertEqual(outbox.pendingReportIds(), ["later"])
     }
 
+    // MARK: - 9. A failed attachment upload is retried, never silently dropped
+
+    /// Success: a submission counts as delivered only when the server confirms it stored the
+    /// attachment (`attachments: 1` in its answer) — and only then is the entry deleted.
+    func testASubmissionIsDeliveredOnceTheServerConfirmsItsAttachment() throws {
+        let outbox = tempOutbox()
+        let sdk = makeSDK(outbox: outbox)
+        var results: [Result<String, Error>] = []
+        let sent = expectation(description: "onFeedbackSent")
+        sdk.onFeedbackSent = { results.append($0); sent.fulfill() }
+
+        let outcome = try submit(sdk, blobs: [screenshotBlob()])
+        guard case .delivered(let id) = outcome else { return XCTFail("expected delivered, got \(outcome)") }
+        wait(for: [sent], timeout: 5)
+
+        XCTAssertEqual(id, "fb_server")
+        XCTAssertEqual(try results.map { try $0.get() }, ["fb_server"])
+        let reportId = try XCTUnwrap(Self.field("reportId", in: XCTUnwrap(stub.reportBodies.first)))
+        XCTAssertEqual(stub.storedAttachmentCount(reportId: reportId), 1, "the server has the screenshot")
+        XCTAssertEqual(outbox.count, 0)
+    }
+
+    /// The production failure: R2 answers the presigned PUT with 403. The report must reach the
+    /// dashboard at once, and the screenshot must stay queued — not dropped, not reported as
+    /// delivered. The next flush mints a FRESH upload URL (the server never hands one back on a
+    /// re-POST), uploads the bytes, and re-posts the report under the same `reportId`; only then
+    /// does `onFeedbackSent` fire, exactly once.
+    func testAnR2403KeepsTheScreenshotQueuedAndTheNextFlushDeliversIt() throws {
+        let outbox = tempOutbox()
+        let sdk = makeSDK(outbox: outbox)
+        stub.putStatus = 403
+        var results: [Result<String, Error>] = []
+        let sent = expectation(description: "onFeedbackSent fires once, with the final outcome")
+        sdk.onFeedbackSent = { results.append($0); sent.fulfill() }
+
+        let outcome = try submit(sdk, message: "checkout is broken", blobs: [screenshotBlob(128)])
+        guard case .attachmentsPending(let id) = outcome else {
+            return XCTFail("a 403 from R2 must leave the screenshot pending, got \(outcome)")
+        }
+        XCTAssertEqual(id, "fb_server", "the report itself reached the server")
+        let firstPost = try XCTUnwrap(stub.reportBodies.first)
+        XCTAssertTrue(firstPost.contains("name=\"message\"\r\n\r\ncheckout is broken"))
+        XCTAssertEqual(try Self.attachmentCount(in: firstPost), 0, "nothing had landed yet")
+        let reportId = try XCTUnwrap(Self.field("reportId", in: firstPost))
+        XCTAssertEqual(outbox.blobData(reportId: reportId, index: 0)?.count, 128, "the bytes are kept")
+        XCTAssertEqual(outbox.attachmentAttempts(reportId: reportId), 1)
+        settle()
+        XCTAssertTrue(results.isEmpty, "no outcome yet — the screenshot is still on its way")
+
+        stub.putStatus = 200 // R2 is fixed
+        sdk.flushPending()
+        wait(for: [sent], timeout: 5)
+
+        XCTAssertEqual(try results.map { try $0.get() }, ["fb_server"])
+        XCTAssertEqual(stub.mintCount, 2, "the retry minted a fresh presigned URL")
+        XCTAssertEqual(stub.putCount, 2)
+        XCTAssertEqual(stub.reportBodies.count, 2, "the report was re-posted once the screenshot landed")
+        XCTAssertEqual(
+            Set(stub.reportBodies.compactMap { Self.field("reportId", in: $0) }), [reportId],
+            "the re-POST reuses the reportId, so the server dedupes onto the same report"
+        )
+        XCTAssertEqual(try Self.attachmentCount(in: XCTUnwrap(stub.reportBodies.last)), 1)
+        XCTAssertEqual(stub.storedAttachmentCount(reportId: reportId), 1)
+        XCTAssertEqual(outbox.count, 0, "delivered in full: the entry is gone")
+    }
+
+    /// Bounded, never silent: when R2 never recovers, the SDK gives up on the screenshot once
+    /// the retry limits are spent, and says so — `onFeedbackSent` gets a
+    /// `CatchDevAttachmentsNotDelivered` carrying the report's server id — and drops the entry.
+    func testGivesUpOnAnAttachmentOnlyWhenTheRetryLimitsRunOut() throws {
+        let outbox = tempOutbox()
+        let sdk = makeSDK(outbox: outbox, limits: .init(maxAttempts: 3, maxAge: 0))
+        stub.putStatus = 403 // R2 never recovers
+        var results: [Result<String, Error>] = []
+        let sent = expectation(description: "onFeedbackSent")
+        sdk.onFeedbackSent = { results.append($0); sent.fulfill() }
+
+        let outcome = try submit(sdk, blobs: [screenshotBlob()]) // attempt 1
+        guard case .attachmentsPending = outcome else { return XCTFail("expected pending, got \(outcome)") }
+        let reportId = try XCTUnwrap(Self.field("reportId", in: XCTUnwrap(stub.reportBodies.first)))
+
+        flushAndWait(sdk, until: "attempt 2 is counted") { outbox.attachmentAttempts(reportId: reportId) == 2 }
+        XCTAssertTrue(results.isEmpty, "attempt 2 of 3: still retrying")
+        XCTAssertEqual(outbox.blobData(reportId: reportId, index: 0)?.count, 64, "the bytes are still kept")
+
+        sdk.flushPending() // attempt 3: the limit
+        wait(for: [sent], timeout: 5)
+
+        guard case .failure(let error as CatchDevAttachmentsNotDelivered) = try XCTUnwrap(results.first) else {
+            return XCTFail("giving up must be reported as CatchDevAttachmentsNotDelivered, got \(results)")
+        }
+        XCTAssertEqual(error.reportId, "fb_server", "the report itself was delivered, under this id")
+        XCTAssertEqual(error.missingCount, 1)
+        guard case .server(let status)? = error.underlyingError as? CatchDevError else {
+            return XCTFail("the last upload failure travels with it, got \(String(describing: error.underlyingError))")
+        }
+        XCTAssertEqual(status, 403)
+        XCTAssertEqual(stub.reportBodies.count, 3, "the report was re-posted on every attempt")
+        XCTAssertEqual(stub.putCount, 3)
+        XCTAssertEqual(outbox.count, 0, "given up: the entry is gone")
+
+        flushAndWait(sdk, until: "a flush of the now-empty outbox finishes") { true }
+        XCTAssertEqual(stub.reportBodies.count, 3, "nothing is left to retry")
+        XCTAssertEqual(results.count, 1, "onFeedbackSent fires once per submission")
+    }
+
+    /// Both limits must be spent. An entry younger than `maxAge` keeps its attachment however
+    /// many attempts fail; one older than `maxAge` is given up on at the attempt limit.
+    func testTheGiveUpAlsoWaitsForTheEntryToBeOldEnough() throws {
+        let outbox = tempOutbox()
+        let sdk = makeSDK(outbox: outbox, limits: .init(maxAttempts: 1, maxAge: 24 * 60 * 60))
+        stub.putStatus = 403
+        var results: [Result<String, Error>] = []
+        sdk.onFeedbackSent = { results.append($0) }
+
+        // Fresh: past the attempt limit at once, but far younger than a day.
+        _ = try submit(sdk, message: "fresh", blobs: [screenshotBlob()])
+        let freshId = try XCTUnwrap(Self.field("reportId", in: XCTUnwrap(stub.reportBodies.first)))
+        flushAndWait(sdk, until: "attempt 2 is counted") { outbox.attachmentAttempts(reportId: freshId) == 2 }
+        XCTAssertNotNil(outbox.entry(reportId: freshId), "too young to give up on")
+
+        // Submitted two days ago and queued offline since: its first failed attempt that
+        // reaches the server is past both limits.
+        var old = FeedbackReport(message: "from two days ago")
+        old.reportId = "old"
+        old.time = Self.timestamp(secondsAgo: 2 * 24 * 60 * 60)
+        try outbox.enqueue(old, blobs: [screenshotBlob()])
+
+        flushAndWait(sdk, until: "the old entry is given up on") { outbox.entry(reportId: "old") == nil }
+        waitUntil("onFeedbackSent reports it") { !results.isEmpty }
+        guard case .failure(let error as CatchDevAttachmentsNotDelivered) = try XCTUnwrap(results.first) else {
+            return XCTFail("expected CatchDevAttachmentsNotDelivered, got \(results)")
+        }
+        XCTAssertEqual(error.missingCount, 1)
+        XCTAssertEqual(results.count, 1, "only the old entry is settled")
+        XCTAssertNotNil(outbox.entry(reportId: freshId), "the fresh entry is still retrying")
+    }
+
+    /// A network error reaching R2 (the API answers, the bucket's host doesn't): the report
+    /// lands, the screenshot stays queued, and it goes up once R2 is reachable again.
+    func testANetworkErrorOnTheUploadKeepsTheScreenshotAndALaterFlushDeliversIt() throws {
+        let outbox = tempOutbox()
+        let sdk = makeSDK(outbox: outbox)
+        stub.putTransportFails = true
+        var results: [Result<String, Error>] = []
+        let sent = expectation(description: "onFeedbackSent")
+        sdk.onFeedbackSent = { results.append($0); sent.fulfill() }
+
+        let outcome = try submit(sdk, blobs: [screenshotBlob()])
+        guard case .attachmentsPending = outcome else { return XCTFail("expected pending, got \(outcome)") }
+        let reportId = try XCTUnwrap(Self.field("reportId", in: XCTUnwrap(stub.reportBodies.first)))
+        XCTAssertEqual(outbox.blobData(reportId: reportId, index: 0)?.count, 64, "the bytes are kept")
+
+        stub.putTransportFails = false
+        sdk.flushPending()
+        wait(for: [sent], timeout: 5)
+
+        XCTAssertEqual(try results.map { try $0.get() }, ["fb_server"])
+        XCTAssertEqual(stub.storedAttachmentCount(reportId: reportId), 1)
+        XCTAssertEqual(outbox.count, 0)
+    }
+
+    /// Offline is not an attachment failure: attempts that never reach the server don't count
+    /// toward the give-up limit, so a long offline stretch can't cost the user a screenshot.
+    func testOfflineAttemptsDoNotUseUpTheAttachmentRetries() throws {
+        let outbox = tempOutbox()
+        let sdk = makeSDK(outbox: outbox, limits: .init(maxAttempts: 1, maxAge: 0))
+        stub.offline = true
+
+        let outcome = try submit(sdk, blobs: [screenshotBlob()])
+        guard case .queued(let reportId) = outcome else { return XCTFail("expected queued, got \(outcome)") }
+        for _ in 0..<3 {
+            flushAndWait(sdk, until: "an offline flush finishes") { true }
+        }
+        XCTAssertEqual(outbox.attachmentAttempts(reportId: reportId), 0, "offline attempts are not counted")
+        XCTAssertEqual(outbox.blobData(reportId: reportId, index: 0)?.count, 64)
+
+        stub.offline = false
+        let sent = expectation(description: "delivered")
+        sdk.onFeedbackSent = { result in
+            XCTAssertEqual(try? result.get(), "fb_server")
+            sent.fulfill()
+        }
+        sdk.flushPending()
+        wait(for: [sent], timeout: 5)
+        XCTAssertEqual(outbox.count, 0)
+    }
+
+    /// The upload "succeeded" but the server could not find the object (its R2 HEAD failed), so
+    /// its `attachments` count comes up short. The entry stays, and the retry re-posts the
+    /// reference WITHOUT re-uploading — the bytes already reached R2.
+    func testAShortStoredCountKeepsTheEntryAndTheRetryRepostsWithoutReuploading() throws {
+        let outbox = tempOutbox()
+        let sdk = makeSDK(outbox: outbox)
+        stub.serverCannotFindUploads = true
+        let sent = expectation(description: "onFeedbackSent")
+        sdk.onFeedbackSent = { result in
+            XCTAssertEqual(try? result.get(), "fb_server")
+            sent.fulfill()
+        }
+
+        let outcome = try submit(sdk, blobs: [screenshotBlob()])
+        guard case .attachmentsPending = outcome else {
+            return XCTFail("listed 1, stored 0 is not a delivery, got \(outcome)")
+        }
+        let reportId = try XCTUnwrap(Self.field("reportId", in: XCTUnwrap(stub.reportBodies.first)))
+        XCTAssertEqual(outbox.entry(reportId: reportId)?.report.attachments.count, 1, "its receipt is kept")
+
+        stub.serverCannotFindUploads = false
+        sdk.flushPending()
+        wait(for: [sent], timeout: 5)
+
+        XCTAssertEqual(stub.putCount, 1, "the bytes were not uploaded twice")
+        XCTAssertEqual(stub.mintCount, 1)
+        XCTAssertEqual(stub.reportBodies.count, 2)
+        XCTAssertEqual(stub.storedAttachmentCount(reportId: reportId), 1)
+        XCTAssertEqual(outbox.count, 0)
+    }
+
     // MARK: - Helpers
 
     /// Let any stray second delivery land before asserting it did not happen.
@@ -486,11 +740,18 @@ final class OfflineOutboxTests: XCTestCase {
 
 /// A stubbed catch.dev + R2 backend for `MockURLProtocol`: routes the presigned-URL mint,
 /// the R2 PUT, and the report POST, and can simulate being offline or rejecting any hop.
+///
+/// The report POST mirrors the real backend's replay semantics: a re-POST under the same
+/// `reportId` keeps what earlier POSTs stored, a listed key is stored only if its bytes really
+/// reached R2 (the backend HEAD-checks each one), and the answer carries `attachments: <stored
+/// count>` whenever the report listed any.
 private final class StubbedBackend {
     private let lock = NSLock()
 
     private var _offline = false
     private var _reportTransportFails = false
+    private var _putTransportFails = false
+    private var _serverCannotFindUploads = false
     private var _mintStatus = 200
     private var _putStatus = 200
     private var _reportStatus = 200
@@ -499,6 +760,10 @@ private final class StubbedBackend {
     private var _putCount = 0
     private var _reportBodies: [String] = []
     private var _onFirstPut: (() -> Void)?
+    /// Keys whose R2 PUT returned 2xx.
+    private var _landedKeys: Set<String> = []
+    /// reportId → the attachment keys the "server" has stored for that report.
+    private var _storedKeys: [String: Set<String>] = [:]
 
     var offline: Bool {
         get { lock.lock(); defer { lock.unlock() }; return _offline }
@@ -525,6 +790,26 @@ private final class StubbedBackend {
     var mintStatus: Int {
         get { lock.lock(); defer { lock.unlock() }; return _mintStatus }
         set { lock.lock(); defer { lock.unlock() }; _mintStatus = newValue }
+    }
+    /// What R2 answers the presigned PUT with (403 is the production failure: R2 not enabled).
+    var putStatus: Int {
+        get { lock.lock(); defer { lock.unlock() }; return _putStatus }
+        set { lock.lock(); defer { lock.unlock() }; _putStatus = newValue }
+    }
+    /// Fail only the R2 PUT at the transport layer — the API answers, R2's host doesn't.
+    var putTransportFails: Bool {
+        get { lock.lock(); defer { lock.unlock() }; return _putTransportFails }
+        set { lock.lock(); defer { lock.unlock() }; _putTransportFails = newValue }
+    }
+    /// The server's HEAD-check of listed keys fails, so it stores none of them.
+    var serverCannotFindUploads: Bool {
+        get { lock.lock(); defer { lock.unlock() }; return _serverCannotFindUploads }
+        set { lock.lock(); defer { lock.unlock() }; _serverCannotFindUploads = newValue }
+    }
+    /// How many attachments the "server" holds for a report, across all its POSTs.
+    func storedAttachmentCount(reportId: String) -> Int {
+        lock.lock(); defer { lock.unlock() }
+        return _storedKeys[reportId]?.count ?? 0
     }
     var reportStatus: Int {
         get { lock.lock(); defer { lock.unlock() }; return _reportStatus }
@@ -562,16 +847,47 @@ private final class StubbedBackend {
             }
 
             if path.hasSuffix("/feedback/report") {
-                _reportBodies.append(Self.bodyString(request))
+                let body = Self.bodyString(request)
+                _reportBodies.append(body)
                 if _reportTransportFails { throw URLError(.networkConnectionLost) }
                 guard _reportStatus == 200 else { return (Self.response(request, _reportStatus), Data()) }
-                return (Self.response(request, 200), Data("{\"id\":\"fb_server\"}".utf8))
+                let reportId = Self.multipartField("reportId", in: body) ?? ""
+                let listed = Self.attachmentKeys(in: body)
+                var stored = _storedKeys[reportId] ?? []
+                if !_serverCannotFindUploads {
+                    stored.formUnion(listed.filter { _landedKeys.contains($0) })
+                }
+                _storedKeys[reportId] = stored
+                let count = (!listed.isEmpty || !stored.isEmpty) ? ",\"attachments\":\(stored.count)" : ""
+                return (Self.response(request, 200), Data("{\"id\":\"fb_server\"\(count)}".utf8))
             }
 
-            // Anything else is the presigned PUT straight to R2.
+            // Anything else is the presigned PUT straight to R2 (`/put/<n>` ↔ key
+            // `feedback/uploads/<n>.bin`, as minted above).
+            if _putTransportFails { throw URLError(.timedOut) }
             _putCount += 1
+            if (200..<300).contains(_putStatus), let n = request.url?.lastPathComponent {
+                _landedKeys.insert("feedback/uploads/\(n).bin")
+            }
             return (Self.response(request, _putStatus), Data())
         }
+    }
+
+    /// One multipart field's value from a captured report body.
+    private static func multipartField(_ name: String, in body: String) -> String? {
+        guard let start = body.range(of: "name=\"\(name)\"\r\n\r\n") else { return nil }
+        let rest = body[start.upperBound...]
+        guard let end = rest.range(of: "\r\n") else { return nil }
+        return String(rest[..<end.lowerBound])
+    }
+
+    /// The R2 keys a report body lists in its `attachments` field.
+    private static func attachmentKeys(in body: String) -> [String] {
+        guard
+            let json = multipartField("attachments", in: body),
+            let list = try? JSONSerialization.jsonObject(with: Data(json.utf8)) as? [[String: Any]]
+        else { return [] }
+        return list.compactMap { $0["key"] as? String }
     }
 
     /// Take the one-shot PUT hook, so a flush it triggers can't re-trigger itself.

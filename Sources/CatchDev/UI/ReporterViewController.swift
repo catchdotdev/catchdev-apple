@@ -548,6 +548,10 @@ final class ReporterViewController: UIViewController {
                     switch result {
                     case .success(.delivered(let id)):
                         self.showSuccess(reportId: id.isEmpty ? self.reportId : id, queued: false)
+                    case .success(.attachmentsPending(let id)):
+                        // The report is on the server; an attachment upload failed and stays
+                        // queued for the next flush. Say so rather than imply it all arrived.
+                        self.showSuccess(reportId: id, queued: false, attachmentsPending: true)
                     case .success(.queued(let id)):
                         // Durably saved, just not sent yet — a success, not an error. Distinguish
                         // "you're offline" from "the server was briefly unreachable" by the device's
@@ -562,8 +566,13 @@ final class ReporterViewController: UIViewController {
         }
     }
 
-    private func showSuccess(reportId: String, queued: Bool, offline: Bool = false) {
-        let success = SuccessOverlayView(type: reportType, reportId: reportId, queued: queued, offline: offline)
+    private func showSuccess(
+        reportId: String, queued: Bool, offline: Bool = false, attachmentsPending: Bool = false
+    ) {
+        let success = SuccessOverlayView(
+            type: reportType, reportId: reportId, queued: queued, offline: offline,
+            attachmentsPending: attachmentsPending
+        )
         success.onDone = { [weak self] in self?.dismiss(animated: true) }
         showOverlay(success)
     }
@@ -587,8 +596,13 @@ final class ReporterViewController: UIViewController {
     }
 
     private func presentError(_ error: Error) {
+        var title = "Couldn’t send report"
         let message: String
         switch error {
+        case is CatchDevAttachmentsNotDelivered:
+            // The report itself landed; Send again re-uploads under the same report id.
+            title = "Attachments not sent"
+            message = "Your report was sent, but its attachments couldn’t be uploaded. Send again to retry them."
         case CatchDevError.transport:
             message = "Couldn’t reach the server. Check your connection and try again."
         case CatchDevError.server(let status) where status == 401 || status == 403:
@@ -596,7 +610,7 @@ final class ReporterViewController: UIViewController {
         default:
             message = "Something went wrong. Please try again."
         }
-        let alert = UIAlertController(title: "Couldn’t send report", message: message, preferredStyle: .alert)
+        let alert = UIAlertController(title: title, message: message, preferredStyle: .alert)
         alert.addAction(UIAlertAction(title: "OK", style: .default))
         present(alert, animated: true)
     }

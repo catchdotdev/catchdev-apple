@@ -118,7 +118,10 @@ final class SendingOverlayView: UIView {
 final class SuccessOverlayView: UIView {
     var onDone: (() -> Void)?
 
-    init(type: ReportType, reportId: String, queued: Bool = false, offline: Bool = true) {
+    init(
+        type: ReportType, reportId: String, queued: Bool = false, offline: Bool = true,
+        attachmentsPending: Bool = false
+    ) {
         super.init(frame: .zero)
         backgroundColor = ReporterTheme.bg
         accessibilityIdentifier = queued
@@ -145,6 +148,8 @@ final class SuccessOverlayView: UIView {
             subtitle.text = offline
                 ? "You're offline — we'll send it when you're back online."
                 : "We couldn't reach the server just now — we'll retry automatically."
+        } else if attachmentsPending {
+            subtitle.text = "Its attachments didn't upload yet — we'll retry them automatically."
         } else {
             subtitle.text = type == .bug
                 ? "Thanks — the team can see exactly what happened."
