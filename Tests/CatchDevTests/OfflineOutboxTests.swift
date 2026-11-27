@@ -681,6 +681,29 @@ final class OfflineOutboxTests: XCTestCase {
         XCTAssertEqual(outbox.count, 0)
     }
 
+    /// Bytes that are on disk but can't be read, with no receipt, are an ordinary failed
+    /// attachment: the report still lands, the entry stays incomplete, and the attempt counts.
+    /// (Missing bytes are never read as "already uploaded" without a receipt.)
+    func testUnreadableAttachmentBytesCountAsAFailedUpload() throws {
+        let outbox = tempOutbox()
+        let directory = try XCTUnwrap(tempDirs.last)
+        let sdk = makeSDK(outbox: outbox)
+        stub.offline = true
+        let outcome = try submit(sdk, blobs: [screenshotBlob()])
+        guard case .queued(let reportId) = outcome else { return XCTFail("expected queued, got \(outcome)") }
+
+        let bytes = directory.appendingPathComponent("\(reportId)/blobs/0.bin")
+        try FileManager.default.setAttributes([.posixPermissions: 0o000], ofItemAtPath: bytes.path)
+        defer { try? FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: bytes.path) }
+
+        stub.offline = false
+        flushAndWait(sdk, until: "the attempt is counted") { outbox.attachmentAttempts(reportId: reportId) == 1 }
+
+        XCTAssertEqual(stub.reportBodies.count, 1, "the report itself was posted")
+        XCTAssertEqual(stub.putCount, 0, "nothing could be uploaded")
+        XCTAssertNotNil(outbox.entry(reportId: reportId), "incomplete: the entry stays")
+    }
+
     /// The upload "succeeded" but the server could not find the object (its R2 HEAD failed), so
     /// its `attachments` count comes up short. The entry stays, and the retry re-posts the
     /// reference WITHOUT re-uploading — the bytes already reached R2.

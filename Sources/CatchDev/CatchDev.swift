@@ -603,45 +603,38 @@ public final class CatchDev: NSObject {
         uploadBlobs(
             report: report, blobs: blobs, index: 0, failures: [], loadBlob: loadBlob,
             outbox: outbox, configuration: configuration
-        ) { [weak self] result in
+        ) { [weak self] pass in
             guard let self else { return }
-            switch result {
-            case .failure(let error):
-                // A blob's bytes vanished with no receipt (see `uploadBlobs`). Never POST
-                // without proof of what landed; the entry stays for a later attempt.
-                completion(.deferred(error))
-            case .success(let pass):
-                let ready = pass.report
-                self.client.send(ready, configuration: configuration) { [weak self] sendResult in
-                    guard let self else { return }
-                    // Back onto the outbox queue: deleting the entry is disk IO, and this
-                    // callback is running on the URLSession's delegate thread.
-                    self.outboxQueue.async {
-                        switch sendResult {
-                        case .success(let ack):
-                            let id = ack.id.isEmpty ? report.reportId : ack.id
-                            // References the server could not find in R2 (its HEAD came back
-                            // empty or failed): the upload "succeeded", yet the attachment isn't
-                            // stored. A server too old to send the count is taken at its word.
-                            let listed = ready.attachments.count
-                            let unconfirmed = max(0, listed - (ack.storedAttachments ?? listed))
-                            if pass.failures.isEmpty, unconfirmed == 0 {
-                                outbox?.remove(reportId: report.reportId) // ack-then-delete
-                                completion(.delivered(id: id))
-                            } else {
-                                completion(self.settleMissingAttachments(
-                                    report: report, id: id, failures: pass.failures,
-                                    unconfirmed: unconfirmed, outbox: outbox
-                                ))
-                            }
-                        case .failure(let error):
-                            switch DeliveryFailure(error) {
-                            case .permanent(let error):
-                                outbox?.remove(reportId: report.reportId)
-                                completion(.rejected(error))
-                            case .retryable(let error):
-                                completion(.deferred(error))
-                            }
+            let ready = pass.report
+            self.client.send(ready, configuration: configuration) { [weak self] sendResult in
+                guard let self else { return }
+                // Back onto the outbox queue: deleting the entry is disk IO, and this callback is
+                // running on the URLSession's delegate thread.
+                self.outboxQueue.async {
+                    switch sendResult {
+                    case .success(let ack):
+                        let id = ack.id.isEmpty ? report.reportId : ack.id
+                        // References the server could not find in R2 (its HEAD came back empty
+                        // or failed): the upload "succeeded", yet the attachment isn't stored. A
+                        // server too old to send the count is taken at its word.
+                        let listed = ready.attachments.count
+                        let unconfirmed = max(0, listed - (ack.storedAttachments ?? listed))
+                        if pass.failures.isEmpty, unconfirmed == 0 {
+                            outbox?.remove(reportId: report.reportId) // ack-then-delete
+                            completion(.delivered(id: id))
+                        } else {
+                            completion(self.settleMissingAttachments(
+                                report: report, id: id, failures: pass.failures,
+                                unconfirmed: unconfirmed, outbox: outbox
+                            ))
+                        }
+                    case .failure(let error):
+                        switch DeliveryFailure(error) {
+                        case .permanent(let error):
+                            outbox?.remove(reportId: report.reportId)
+                            completion(.rejected(error))
+                        case .retryable(let error):
+                            completion(.deferred(error))
                         }
                     }
                 }
@@ -716,33 +709,30 @@ public final class CatchDev: NSObject {
         loadBlob: @escaping (OutboxBlob) -> Data?,
         outbox: FeedbackOutbox?,
         configuration: Configuration,
-        completion: @escaping (Result<UploadPass, Error>) -> Void
+        completion: @escaping (UploadPass) -> Void
     ) {
         guard index < blobs.count else {
-            completion(.success(UploadPass(report: report, failures: failures)))
+            completion(UploadPass(report: report, failures: failures))
             return
         }
         let blob = blobs[index]
         guard let data = loadBlob(blob) else {
-            // The bytes we were told are still pending are GONE. "Gone" is only safe to read as
-            // "already uploaded" when the outbox can PROVE it — i.e. the entry is still on disk
-            // and holds a receipt for this exact blob index. Without that proof (the entry was
-            // evicted or corrupted under us) the honest answer is a RETRYABLE failure: skipping
-            // the blob with nothing in hand would POST the report *without* its evidence, and
-            // the 2xx ack would then delete the entry and make the loss permanent. That is
-            // precisely the bug the delivery claim exists to prevent — this is its backstop.
-            guard
-                let outbox,
-                let receipt = outbox.uploadedAttachment(reportId: report.reportId, index: blob.index)
-            else {
-                log("blob \(blob.index) of \(report.reportId) vanished with no receipt — retrying later")
-                completion(.failure(CatchDevError.transport(OutboxError.blobMissing)))
-                return
-            }
+            // The bytes we were told are still pending are gone or unreadable. "Gone" may only
+            // be read as "already uploaded" with PROOF: a receipt for this exact blob index.
+            // Without one it is an ordinary failed blob — it stays pending, and the entry
+            // cannot complete (or be ack-deleted) without it.
             var next = report
-            if !next.attachments.contains(receipt) { next.attachments.append(receipt) }
+            var failed = failures
+            if let receipt = outbox?.uploadedAttachment(reportId: report.reportId, index: blob.index) {
+                if !next.attachments.contains(receipt) { next.attachments.append(receipt) }
+            } else {
+                log("blob \(blob.index) of \(report.reportId) is unreadable with no receipt — kept for retry")
+                failed.append(AttachmentFailure(
+                    blob: blob, error: CatchDevError.transport(OutboxError.blobMissing)
+                ))
+            }
             uploadBlobs(
-                report: next, blobs: blobs, index: index + 1, failures: failures, loadBlob: loadBlob,
+                report: next, blobs: blobs, index: index + 1, failures: failed, loadBlob: loadBlob,
                 outbox: outbox, configuration: configuration, completion: completion
             )
             return
@@ -970,6 +960,10 @@ public final class CatchDev: NSObject {
     /// Logged whether or not debug logging is on. Reserved for the SDK giving up on something
     /// the user submitted, which must never happen silently.
     func warn(_ message: String) {
+        Self.warn(message)
+    }
+
+    static func warn(_ message: String) {
         NSLog("[CatchDev] %@", message)
     }
 

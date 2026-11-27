@@ -37,9 +37,9 @@ struct OutboxBlob: Codable, Equatable {
 
 /// Failures the outbox itself raises into a delivery.
 enum OutboxError: Error {
-    /// A blob the entry listed as pending has neither its bytes nor a receipt: the entry was
-    /// evicted or corrupted underneath the delivery. Always retryable — a report must never be
-    /// POSTed (and then ack-deleted) with its evidence silently dropped.
+    /// A blob the entry listed as pending has neither readable bytes nor a receipt. It counts as
+    /// a failed attachment: the entry stays incomplete, so it is never ack-deleted with its
+    /// evidence silently dropped.
     case blobMissing
 }
 
@@ -592,8 +592,16 @@ final class FeedbackOutbox {
         }
         func evict(at index: Int) {
             let victim = headers.remove(at: index)
+            // Never silent. An entry with recorded attachment attempts already had its report
+            // acked, so only its unsent attachments are lost; any other entry loses the report.
+            let delivered = attachmentAttemptsLocked(reportId: victim.reportId) > 0
             try? fileManager.removeItem(
                 at: directory.appendingPathComponent(victim.reportId, isDirectory: true)
+            )
+            CatchDev.warn(
+                delivered
+                    ? "outbox full: gave up on the attachments of report \(victim.reportId) (the report itself was delivered)"
+                    : "outbox full: dropped report \(victim.reportId) before it could be delivered"
             )
         }
 
