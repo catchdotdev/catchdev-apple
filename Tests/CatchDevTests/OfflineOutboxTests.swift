@@ -11,6 +11,8 @@ final class OfflineOutboxTests: XCTestCase {
     private let endpoint = URL(string: "https://api.catch.dev")!
     private var tempDirs: [URL] = []
     private var stub: StubbedBackend!
+    /// Every line the SDK logged with `warn` (the lines it logs even with debug logging off).
+    private let warnings = WarningLog()
 
     override func setUp() {
         super.setUp()
@@ -35,16 +37,25 @@ final class OfflineOutboxTests: XCTestCase {
         return FeedbackOutbox(directory: dir, maxEntries: maxEntries, maxBytes: maxBytes)
     }
 
+    /// An SDK over `outbox` and the stubbed backend. Attachment retries default to no backoff,
+    /// because most tests here are about what a retry does, not when; the backoff tests pass
+    /// `.standard` and a `clock` they move forward.
     private func makeSDK(
         outbox: FeedbackOutbox,
-        limits: CatchDev.AttachmentRetryLimits = .standard
+        limits: CatchDev.AttachmentRetryLimits = .standard,
+        backoff: CatchDev.AttachmentRetryBackoff = .immediate,
+        clock: TestClock? = nil
     ) -> CatchDev {
         let session = URLSession(configuration: MockURLProtocol.sessionConfiguration())
+        let warnings = self.warnings
         let sdk = CatchDev(
             client: FeedbackClient(session: session, boundaryProvider: { "B" }),
             uploader: AttachmentUploader(session: session),
             outbox: outbox,
-            attachmentRetryLimits: limits
+            attachmentRetryLimits: limits,
+            attachmentRetryBackoff: backoff,
+            now: { clock?.now ?? Date() },
+            warningLog: { warnings.append($0) }
         )
         sdk.configure(apiKey: "ck", endpoint: endpoint)
         return sdk
@@ -89,6 +100,14 @@ final class OfflineOutboxTests: XCTestCase {
         PendingBlob(
             kind: .recording, data: Data(repeating: 0x11, count: bytes),
             contentType: "video/mp4", filename: "recording.mp4", annotated: false
+        )
+    }
+
+    /// A picked file; its size tells the files of one test apart.
+    private func fileBlob(_ bytes: Int) -> PendingBlob {
+        PendingBlob(
+            kind: .file, data: Data(repeating: 0x22, count: bytes),
+            contentType: "text/plain", filename: "notes-\(bytes).txt", annotated: false
         )
     }
 
@@ -474,7 +493,7 @@ final class OfflineOutboxTests: XCTestCase {
             var later = FeedbackReport(message: "queued behind it")
             later.reportId = "later"
             later.time = "2099-01-01T00:00:00Z"
-            try? outbox.enqueue(later)
+            _ = try? outbox.enqueue(later)
         }
 
         let outcome = try submit(sdk, message: "two files", blobs: [screenshotBlob(64), recordingBlob(128)])
@@ -735,6 +754,281 @@ final class OfflineOutboxTests: XCTestCase {
         XCTAssertEqual(outbox.count, 0)
     }
 
+    // MARK: - 10. At most ten attachments per report
+
+    /// The backend stores only the first 10 references a report lists. A submission with more
+    /// (the reporter never offers more, but any other path might) is trimmed before it is
+    /// persisted: the entry holds 10, the screenshot first even though it came last, and each
+    /// dropped attachment is logged. The report is complete once the 10 kept ones land; nothing
+    /// waits for the dropped ones.
+    func testASubmissionWithMoreThanTenAttachmentsIsTrimmedToTenScreenshotFirst() throws {
+        let outbox = tempOutbox()
+        let sdk = makeSDK(outbox: outbox)
+        stub.offline = true
+        let files = (1...11).map { fileBlob(100 + $0) }
+        let outcome = try submit(sdk, blobs: files + [screenshotBlob()])
+        guard case .queued(let reportId) = outcome else { return XCTFail("expected queued, got \(outcome)") }
+
+        let entry = try XCTUnwrap(outbox.entry(reportId: reportId))
+        XCTAssertEqual(entry.blobs.count, 10, "the entry never holds more than the server keeps")
+        XCTAssertEqual(entry.blobs.first?.kind, .screenshot, "the screenshot is kept, and listed first")
+        XCTAssertEqual(entry.blobs.dropFirst().map(\.size), (1...9).map { 100 + $0 }, "then the first nine files")
+        XCTAssertEqual(warnings.lines.count, 2, "one warning per dropped attachment")
+        XCTAssertTrue(
+            warnings.lines.allSatisfy { $0.contains(reportId) && $0.contains("dropped a file attachment") },
+            "\(warnings.lines)"
+        )
+
+        stub.offline = false
+        let sent = expectation(description: "delivered")
+        sdk.onFeedbackSent = { result in
+            XCTAssertEqual(try? result.get(), "fb_server")
+            sent.fulfill()
+        }
+        sdk.flushPending()
+        wait(for: [sent], timeout: 5)
+
+        XCTAssertEqual(stub.putCount, 10)
+        XCTAssertEqual(try Self.attachmentCount(in: XCTUnwrap(stub.reportBodies.last)), 10)
+        XCTAssertEqual(stub.storedAttachmentCount(reportId: reportId), 10)
+        XCTAssertEqual(outbox.count, 0, "complete: the dropped attachments are not waited for")
+    }
+
+    /// References the caller already uploaded keep their place (they come first on the wire),
+    /// and the blobs share the room left, screenshots first. The same rule as the Android SDK.
+    func testReferencesAlreadyUploadedKeepTheirPlaceAndTheBlobsShareTheRest() throws {
+        let outbox = tempOutbox()
+        let sdk = makeSDK(outbox: outbox)
+        stub.offline = true
+        let refs = (1...8).map {
+            Attachment(key: "feedback/uploads/ref-\($0).bin", kind: .file, contentType: "text/plain", size: $0)
+        }
+        var outcome: Result<CatchDev.SubmissionOutcome, Error>?
+        let done = expectation(description: "submit")
+        sdk.submit(
+            message: "eight already uploaded", imageData: nil, attachments: refs,
+            pendingAttachments: [fileBlob(201), fileBlob(202), screenshotBlob()]
+        ) { result in
+            outcome = result
+            done.fulfill()
+        }
+        wait(for: [done], timeout: 5)
+        guard case .queued(let reportId) = try XCTUnwrap(outcome).get() else {
+            return XCTFail("expected queued, got \(String(describing: outcome))")
+        }
+
+        let entry = try XCTUnwrap(outbox.entry(reportId: reportId))
+        XCTAssertEqual(entry.report.attachments, refs, "the eight references keep their place")
+        XCTAssertEqual(entry.blobs.map(\.kind), [.screenshot, .file], "two slots left: the screenshot, then a file")
+        XCTAssertEqual(entry.blobs.last?.size, 201, "the first file")
+        XCTAssertEqual(warnings.lines.count, 1)
+    }
+
+    /// Without a durable outbox (the disk can't be written), the in-memory send is trimmed the
+    /// same way.
+    func testWithoutADurableOutboxTheInMemorySendIsTrimmedTheSameWay() throws {
+        let session = URLSession(configuration: MockURLProtocol.sessionConfiguration())
+        let warnings = self.warnings
+        let sdk = CatchDev(
+            client: FeedbackClient(session: session, boundaryProvider: { "B" }),
+            uploader: AttachmentUploader(session: session),
+            outbox: nil,
+            warningLog: { warnings.append($0) }
+        )
+        sdk.configure(apiKey: "ck", endpoint: endpoint)
+
+        let outcome = try submit(sdk, blobs: (1...12).map { fileBlob(300 + $0) })
+        guard case .delivered = outcome else { return XCTFail("expected delivered, got \(outcome)") }
+        XCTAssertEqual(stub.putCount, 10)
+        XCTAssertEqual(try Self.attachmentCount(in: XCTUnwrap(stub.reportBodies.last)), 10)
+        XCTAssertEqual(warnings.lines.count, 2)
+    }
+
+    /// An entry queued by an SDK version without the limit (0.1.2 or older) can hold more. It
+    /// is trimmed when the flush reads it back, screenshot first and with a warning per dropped
+    /// attachment, so it completes instead of retrying the extra ones until the give-up.
+    func testAnEntryQueuedWithMoreThanTenAttachmentsIsTrimmedBeforeItIsDelivered() throws {
+        let outbox = tempOutbox()
+        var legacy = FeedbackReport(message: "queued before the limit existed")
+        legacy.reportId = "legacy"
+        // The outbox stores what it is given (only `submit` trims), so this is how such an
+        // entry looks on disk.
+        try outbox.enqueue(legacy, blobs: (1...11).map { fileBlob(100 + $0) } + [screenshotBlob()])
+        XCTAssertEqual(outbox.entry(reportId: "legacy")?.blobs.count, 12, "precondition: over the limit")
+
+        let sdk = makeSDK(outbox: outbox) // starting the SDK flushes the outbox
+        waitUntil("the entry is delivered") { outbox.count == 0 && !sdk.isFlushInProgress }
+
+        XCTAssertEqual(stub.putCount, 10, "only the ten kept attachments were uploaded")
+        let body = try XCTUnwrap(stub.reportBodies.last)
+        XCTAssertEqual(try Self.attachmentCount(in: body), 10)
+        XCTAssertTrue(body.contains("\"kind\":\"screenshot\""), "the screenshot was kept, though it came last")
+        XCTAssertEqual(stub.storedAttachmentCount(reportId: "legacy"), 10)
+        XCTAssertEqual(warnings.lines.count, 2, "one warning per dropped attachment")
+    }
+
+    // MARK: - 11. Backoff between attachment retries
+
+    /// After an attempt that reached the server but left attachments missing, the entry waits
+    /// out its backoff (60 s after the first). A flush during the wait skips it without
+    /// stopping: the newer report queued behind it is still delivered. The first flush after
+    /// the wait retries it.
+    func testAFlushSkipsAnEntryInItsBackoffWithoutHoldingBackTheOthers() throws {
+        let outbox = tempOutbox()
+        let clock = TestClock()
+        let sdk = makeSDK(outbox: outbox, backoff: .standard, clock: clock)
+        stub.putStatus = 403
+        let first = try submit(sdk, message: "older", blobs: [screenshotBlob()])
+        guard case .attachmentsPending = first else { return XCTFail("expected pending, got \(first)") }
+        let olderId = try XCTUnwrap(Self.field("reportId", in: XCTUnwrap(stub.reportBodies.first)))
+
+        stub.offline = true
+        let second = try submit(sdk, message: "newer", blobs: [screenshotBlob()])
+        guard case .queued(let newerId) = second else { return XCTFail("expected queued, got \(second)") }
+        stub.offline = false
+        stub.putStatus = 200 // storage is fixed: the older entry would succeed now, if it were tried
+
+        clock.advance(by: 30) // inside the older entry's 60 s wait
+        flushAndWait(sdk, until: "the newer report is delivered") { outbox.entry(reportId: newerId) == nil }
+        XCTAssertNotNil(outbox.entry(reportId: olderId), "the waiting entry was skipped")
+        let posted = stub.reportBodies.compactMap { Self.field("reportId", in: $0) }
+        XCTAssertEqual(posted.filter { $0 == olderId }.count, 1, "and not re-posted")
+        XCTAssertEqual(outbox.attachmentAttempts(reportId: olderId), 1)
+
+        let delivered = expectation(description: "the older report completes")
+        sdk.onFeedbackSent = { result in
+            XCTAssertEqual(try? result.get(), "fb_server")
+            delivered.fulfill()
+        }
+        clock.advance(by: 40) // 70 s after the attempt: the wait is over
+        sdk.flushPending()
+        wait(for: [delivered], timeout: 5)
+        XCTAssertEqual(outbox.count, 0)
+    }
+
+    /// The wait runs from the last counted attempt, stamped on the attempts file from the SDK's
+    /// clock, and doubles with each attempt: 60 s, then 120 s, then 240 s.
+    func testTheBackoffRunsFromTheLastCountedAttemptAndDoubles() throws {
+        let outbox = tempOutbox()
+        let clock = TestClock()
+        let sdk = makeSDK(outbox: outbox, backoff: .standard, clock: clock)
+        stub.putStatus = 403
+        let start = clock.now
+        _ = try submit(sdk, blobs: [screenshotBlob()]) // attempt 1, at `start`
+        let reportId = try XCTUnwrap(Self.field("reportId", in: XCTUnwrap(stub.reportBodies.first)))
+
+        func assertNextRetry(after seconds: TimeInterval, _ message: String) throws {
+            let next = try XCTUnwrap(sdk.nextAttachmentRetry(of: reportId), message)
+            XCTAssertEqual(next.timeIntervalSince(start), seconds, accuracy: 0.01, message)
+        }
+        try assertNextRetry(after: 60, "attempt 1: wait 60 s")
+
+        clock.advance(by: 61)
+        flushAndWait(sdk, until: "attempt 2 is counted") { outbox.attachmentAttempts(reportId: reportId) == 2 }
+        try assertNextRetry(after: 61 + 120, "attempt 2, made at 61 s: wait 120 s")
+
+        clock.advance(by: 121)
+        flushAndWait(sdk, until: "attempt 3 is counted") { outbox.attachmentAttempts(reportId: reportId) == 3 }
+        try assertNextRetry(after: 182 + 240, "attempt 3, made at 182 s: wait 240 s")
+    }
+
+    /// The give-up rule is unchanged: at least 5 counted attempts AND 7 days. With the standard
+    /// backoff, the SDK's clock drives both the retries and the age check.
+    func testWithTheStandardBackoffTheGiveUpStillNeedsFiveAttemptsAndSevenDays() throws {
+        let outbox = tempOutbox()
+        let clock = TestClock()
+        let sdk = makeSDK(outbox: outbox, backoff: .standard, clock: clock)
+        stub.putStatus = 403
+        var results: [Result<String, Error>] = []
+        sdk.onFeedbackSent = { results.append($0) }
+
+        _ = try submit(sdk, blobs: [screenshotBlob()]) // attempt 1
+        let reportId = try XCTUnwrap(Self.field("reportId", in: XCTUnwrap(stub.reportBodies.first)))
+        for attempt in 2...6 {
+            clock.advance(by: 6 * 60 * 60) // past any wait
+            flushAndWait(sdk, until: "attempt \(attempt) is counted") {
+                outbox.attachmentAttempts(reportId: reportId) == attempt
+            }
+        }
+        settle()
+        XCTAssertTrue(results.isEmpty, "6 attempts, but only 30 hours old: still retrying")
+        XCTAssertNotNil(outbox.entry(reportId: reportId))
+
+        clock.advance(by: 7 * 24 * 60 * 60)
+        flushAndWait(sdk, until: "it is given up on") { outbox.entry(reportId: reportId) == nil }
+        waitUntil("onFeedbackSent reports it") { !results.isEmpty }
+        guard case .failure(let error as CatchDevAttachmentsNotDelivered) = try XCTUnwrap(results.first) else {
+            return XCTFail("expected CatchDevAttachmentsNotDelivered, got \(results)")
+        }
+        XCTAssertEqual(error.missingCount, 1)
+        XCTAssertEqual(stub.reportBodies.count, 7, "one POST per attempt, no more")
+    }
+
+    // MARK: - 12. A report the outbox evicts gets its final outcome
+
+    /// The outbox is full and a newer report needs the room, so the oldest queued report, never
+    /// delivered, is dropped. `onFeedbackSent` says so once, with `CatchDevOutboxFull`, and
+    /// nothing more is ever reported for it.
+    func testEvictingAReportThatNeverReachedTheServerReportsOutboxFull() throws {
+        let outbox = tempOutbox(maxEntries: 1)
+        let sdk = makeSDK(outbox: outbox)
+        var results: [Result<String, Error>] = []
+        sdk.onFeedbackSent = { results.append($0) }
+        stub.offline = true
+
+        guard case .queued(let olderId) = try submit(sdk, message: "older", blobs: [screenshotBlob()]) else {
+            return XCTFail("expected queued")
+        }
+        try submit(sdk, message: "newer", blobs: [screenshotBlob()])
+        waitUntil("onFeedbackSent reports the eviction") { !results.isEmpty }
+
+        guard case .failure(let error as CatchDevOutboxFull) = try XCTUnwrap(results.first) else {
+            return XCTFail("expected CatchDevOutboxFull, got \(results)")
+        }
+        XCTAssertEqual(error.reportId, olderId)
+        XCTAssertNil(outbox.entry(reportId: olderId))
+
+        stub.offline = false
+        flushAndWait(sdk, until: "the newer report is delivered") { outbox.count == 0 }
+        waitUntil("its outcome arrives") { results.count == 2 }
+        settle()
+        XCTAssertEqual(results.count, 2, "one outcome per report")
+        XCTAssertEqual(try? results.last?.get(), "fb_server")
+        XCTAssertFalse(
+            stub.reportBodies.contains { Self.field("reportId", in: $0) == olderId },
+            "the evicted report never reached the server"
+        )
+    }
+
+    /// The evicted report had already reached the server; its two attachments were still
+    /// waiting for a retry. The outcome is `CatchDevAttachmentsNotDelivered`, caused by
+    /// `CatchDevOutboxFull`.
+    func testEvictingAReportWhoseAttachmentsWerePendingReportsThemNotDelivered() throws {
+        let outbox = tempOutbox(maxEntries: 1)
+        let sdk = makeSDK(outbox: outbox)
+        var results: [Result<String, Error>] = []
+        sdk.onFeedbackSent = { results.append($0) }
+        stub.putStatus = 403
+
+        let older = try submit(sdk, message: "older", blobs: [screenshotBlob(), recordingBlob(256)])
+        guard case .attachmentsPending = older else { return XCTFail("expected pending, got \(older)") }
+        let olderId = try XCTUnwrap(Self.field("reportId", in: XCTUnwrap(stub.reportBodies.first)))
+
+        stub.offline = true
+        try submit(sdk, message: "newer", blobs: [])
+        waitUntil("onFeedbackSent reports the eviction") { !results.isEmpty }
+        settle()
+
+        XCTAssertEqual(results.count, 1, "one outcome, for the evicted report")
+        guard case .failure(let error as CatchDevAttachmentsNotDelivered) = try XCTUnwrap(results.first) else {
+            return XCTFail("expected CatchDevAttachmentsNotDelivered, got \(results)")
+        }
+        XCTAssertEqual(error.reportId, olderId, "the SDK's own id: the server's isn't kept on disk")
+        XCTAssertEqual(error.missingCount, 2, "neither attachment ever uploaded")
+        XCTAssertEqual((error.underlyingError as? CatchDevOutboxFull)?.reportId, olderId)
+        XCTAssertNil(outbox.entry(reportId: olderId))
+    }
+
     // MARK: - Helpers
 
     /// Let any stray second delivery land before asserting it did not happen.
@@ -758,6 +1052,44 @@ final class OfflineOutboxTests: XCTestCase {
         guard let json = field("attachments", in: body) else { return 0 }
         let parsed = try JSONSerialization.jsonObject(with: Data(json.utf8))
         return (parsed as? [Any])?.count ?? 0
+    }
+}
+
+extension CatchDev.AttachmentRetryBackoff {
+    /// No wait between attachment retries, for the tests about what a retry does rather than
+    /// when it happens.
+    static let immediate = CatchDev.AttachmentRetryBackoff(initialDelay: 0, maxDelay: 0)
+}
+
+/// A clock the backoff tests move forward by hand. Read from the SDK's outbox queue, so locked.
+private final class TestClock {
+    private let lock = NSLock()
+    private var current = Date()
+
+    var now: Date {
+        lock.lock(); defer { lock.unlock() }
+        return current
+    }
+
+    func advance(by seconds: TimeInterval) {
+        lock.lock(); defer { lock.unlock() }
+        current = current.addingTimeInterval(seconds)
+    }
+}
+
+/// The lines an SDK logged with `warn`, from whichever thread logged them.
+private final class WarningLog {
+    private let lock = NSLock()
+    private var _lines: [String] = []
+
+    var lines: [String] {
+        lock.lock(); defer { lock.unlock() }
+        return _lines
+    }
+
+    func append(_ line: String) {
+        lock.lock(); defer { lock.unlock() }
+        _lines.append(line)
     }
 }
 
@@ -878,10 +1210,13 @@ private final class StubbedBackend {
                 let listed = Self.attachmentKeys(in: body)
                 var stored = _storedKeys[reportId] ?? []
                 if !_serverCannotFindUploads {
-                    stored.formUnion(listed.filter { _landedKeys.contains($0) })
+                    // Like the backend, only the first 10 references listed count, and at most
+                    // 10 are kept (`MAX_ATTACHMENTS`).
+                    stored.formUnion(listed.prefix(10).filter { _landedKeys.contains($0) })
                 }
                 _storedKeys[reportId] = stored
-                let count = (!listed.isEmpty || !stored.isEmpty) ? ",\"attachments\":\(stored.count)" : ""
+                let storedCount = min(stored.count, 10)
+                let count = (!listed.isEmpty || !stored.isEmpty) ? ",\"attachments\":\(storedCount)" : ""
                 return (Self.response(request, 200), Data("{\"id\":\"fb_server\"\(count)}".utf8))
             }
 

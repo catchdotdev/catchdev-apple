@@ -7,7 +7,18 @@
   <key>NSPrivacyTrackingDomains</key>
   <array/>
   <key>NSPrivacyAccessedAPITypes</key>
-  <array/>
+  <array>
+    <dict>
+      <!-- The outbox reads the modification date of its own attempts file, inside the app
+           container, to space out attachment retries. -->
+      <key>NSPrivacyAccessedAPIType</key>
+      <string>NSPrivacyAccessedAPICategoryFileTimestamp</string>
+      <key>NSPrivacyAccessedAPITypeReasons</key>
+      <array>
+        <string>C617.1</string>
+      </array>
+    </dict>
+  </array>
   <key>NSPrivacyCollectedDataTypes</key>
   <array>
     <dict>

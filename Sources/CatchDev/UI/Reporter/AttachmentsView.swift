@@ -3,7 +3,8 @@ import UIKit
 
 /// The "Add more" block: a row of Screenshot / Record / Attach tools plus a horizontal
 /// strip of attached thumbnails (screenshot with an Annotate badge, recording with a
-/// duration, file with name + size), each removable.
+/// duration, file with name + size), each removable. Once the report holds as many
+/// attachments as it can carry, the tools that would add one are disabled and a hint says so.
 final class AttachmentsView: UIView {
     var onScreenshot: (() -> Void)?
     var onRecord: (() -> Void)?
@@ -14,13 +15,18 @@ final class AttachmentsView: UIView {
     private let thumbsScroll = UIScrollView()
     private let thumbsStack = UIStackView()
     private let toolsRow = UIStackView()
+    private var screenshotTool: UIButton!
+    private var recordTool: UIButton!
+    private var attachTool: UIButton!
+    private let limitHint = UILabel()
 
     init() {
         super.init(frame: .zero)
         buildThumbs()
         buildTools()
+        buildLimitHint()
 
-        let column = UIStackView(arrangedSubviews: [thumbsScroll, toolsRow])
+        let column = UIStackView(arrangedSubviews: [thumbsScroll, toolsRow, limitHint])
         column.axis = .vertical
         column.spacing = 10
         column.translatesAutoresizingMaskIntoConstraints = false
@@ -57,15 +63,25 @@ final class AttachmentsView: UIView {
         toolsRow.axis = .horizontal
         toolsRow.distribution = .fillEqually
         toolsRow.spacing = 8
-        toolsRow.addArrangedSubview(makeTool(
+        let screenshot = makeTool(
             "Screenshot", "camera", CatchDevReporterAccessibility.toolScreenshot
-        ) { [weak self] in self?.onScreenshot?() })
-        toolsRow.addArrangedSubview(makeTool(
+        ) { [weak self] in self?.onScreenshot?() }
+        let record = makeTool(
             "Record", "video", CatchDevReporterAccessibility.toolRecord
-        ) { [weak self] in self?.onRecord?() })
-        toolsRow.addArrangedSubview(makeTool(
+        ) { [weak self] in self?.onRecord?() }
+        let attach = makeTool(
             "Attach", "paperclip", CatchDevReporterAccessibility.toolAttach
-        ) { [weak self] in self?.onAttach?() })
+        ) { [weak self] in self?.onAttach?() }
+        [screenshot, record, attach].forEach { toolsRow.addArrangedSubview($0) }
+        (screenshotTool, recordTool, attachTool) = (screenshot, record, attach)
+    }
+
+    private func buildLimitHint() {
+        limitHint.text = "Up to \(AttachmentLimits.maxPerReport) attachments"
+        limitHint.font = .systemFont(ofSize: 12.5)
+        limitHint.textColor = ReporterTheme.textMuted
+        limitHint.accessibilityIdentifier = CatchDevReporterAccessibility.attachmentLimit
+        limitHint.isHidden = true
     }
 
     private func makeTool(_ title: String, _ symbol: String, _ id: String, action: @escaping () -> Void) -> UIButton {
@@ -93,12 +109,20 @@ final class AttachmentsView: UIView {
 
     // MARK: - Thumbnails
 
-    func setAttachments(_ attachments: [PendingAttachment]) {
+    /// Show `attachments`. With `limitReached`, nothing more may be added: Record and Attach
+    /// are disabled and the hint shows. The Screenshot tool stays enabled while a screenshot is
+    /// attached, because it then marks that one up instead of adding another.
+    func setAttachments(_ attachments: [PendingAttachment], limitReached: Bool) {
         thumbsStack.arrangedSubviews.forEach { $0.removeFromSuperview() }
         thumbsScroll.isHidden = attachments.isEmpty
         for (index, attachment) in attachments.enumerated() {
             thumbsStack.addArrangedSubview(makeThumb(attachment, index: index))
         }
+        let hasScreenshot = attachments.contains { $0.kind == .screenshot }
+        screenshotTool.isEnabled = !limitReached || hasScreenshot
+        recordTool.isEnabled = !limitReached
+        attachTool.isEnabled = !limitReached
+        limitHint.isHidden = !limitReached
     }
 
     private func makeThumb(_ attachment: PendingAttachment, index: Int) -> UIView {

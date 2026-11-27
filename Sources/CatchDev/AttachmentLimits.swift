@@ -2,13 +2,31 @@ import Foundation
 
 /// Per-kind attachment size caps, mirroring what the backend enforces at the
 /// `upload-url` mint (image 8 MB, file 25 MB, recording 50 MB — see the wire
-/// contract). Checking client-side is not just politeness: without a cap the
-/// reporter reads an arbitrarily large user-picked file straight into memory,
-/// which OOM-kills the *host* app long before the server ever sees it.
+/// contract), plus the per-report count cap. Checking client-side is not just
+/// politeness: without a cap the reporter reads an arbitrarily large user-picked
+/// file straight into memory, which OOM-kills the *host* app long before the
+/// server ever sees it.
 enum AttachmentLimits {
     static let maxImageBytes = 8 * 1024 * 1024
     static let maxFileBytes = 25 * 1024 * 1024
     static let maxRecordingBytes = 50 * 1024 * 1024
+
+    /// The most attachments one report can carry, the automatic screenshot included: the
+    /// backend stores only the first 10 references a report lists (`MAX_ATTACHMENTS`). The
+    /// reporter stops offering more at this count, and the delivery layer trims anything past
+    /// it. The Android SDK has the same limit and the same rule.
+    static let maxPerReport = 10
+
+    /// Split `items` into the first `limit` to keep and the rest. Screenshots come first, then
+    /// everything else in its original order, so the kept items list the screenshot first even
+    /// when nothing is dropped. The same rule as the Android SDK's `AttachmentCap.split`.
+    static func split<T>(
+        _ items: [T], limit: Int = maxPerReport, isScreenshot: (T) -> Bool
+    ) -> (kept: [T], dropped: [T]) {
+        let ordered = items.filter(isScreenshot) + items.filter { !isScreenshot($0) }
+        let keep = max(0, limit)
+        return (Array(ordered.prefix(keep)), Array(ordered.dropFirst(keep)))
+    }
 
     static func humanReadable(_ bytes: Int) -> String {
         "\(bytes / (1024 * 1024)) MB"

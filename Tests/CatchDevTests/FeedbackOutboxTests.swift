@@ -280,6 +280,52 @@ final class FeedbackOutboxTests: XCTestCase {
         XCTAssertEqual(outbox.count, 0)
     }
 
+    /// The backoff waits from the last counted attempt: the time it was counted at, kept as the
+    /// attempts file's modification date. No new file, and a relaunch reads the same time.
+    func testLastAttachmentAttemptIsTheTimeTheAttemptWasCountedAt() throws {
+        let outbox = FeedbackOutbox(directory: dir)
+        try outbox.enqueue(report(id: "a", time: "t1"), blobs: [blob(16)])
+        XCTAssertNil(outbox.lastAttachmentAttempt(reportId: "a"), "no attempt counted yet")
+
+        let first = Date(timeIntervalSinceReferenceDate: 800_000_000)
+        outbox.recordAttachmentAttempt(reportId: "a", at: first)
+        XCTAssertEqual(try XCTUnwrap(outbox.lastAttachmentAttempt(reportId: "a")).timeIntervalSince(first), 0, accuracy: 0.001)
+
+        let second = first.addingTimeInterval(90)
+        outbox.recordAttachmentAttempt(reportId: "a", at: second)
+        let relaunched = FeedbackOutbox(directory: dir)
+        XCTAssertEqual(try XCTUnwrap(relaunched.lastAttachmentAttempt(reportId: "a")).timeIntervalSince(second), 0, accuracy: 0.001)
+        XCTAssertEqual(relaunched.attachmentAttempts(reportId: "a"), 2)
+        XCTAssertNil(relaunched.lastAttachmentAttempt(reportId: "gone"))
+    }
+
+    // MARK: - Attachment limit
+
+    /// An entry queued before the limit existed can hold more than the server keeps. Trimming
+    /// it deletes the extras on disk, screenshots first and then the lowest indices, counting
+    /// the references the report already lists.
+    func testTrimAttachmentsDeletesTheBlobsPastTheLimitScreenshotsFirst() throws {
+        let outbox = FeedbackOutbox(directory: dir)
+        let files = (0..<11).map { _ in blob(16, kind: .file) }
+        try outbox.enqueue(report(id: "a", time: "t1"), blobs: files + [blob(16, kind: .screenshot)])
+        outbox.markUploaded(reportId: "a", blobIndex: 0, attachment: uploadedRef) // uploads count too
+
+        XCTAssertEqual(outbox.trimAttachments(reportId: "a").map(\.index), [9, 10])
+        let entry = try XCTUnwrap(outbox.entry(reportId: "a"))
+        XCTAssertEqual(entry.report.attachments.count, 1, "the uploaded one is kept")
+        XCTAssertEqual(entry.blobs.map(\.index), Array(1...8) + [11], "with eight files and the screenshot")
+        XCTAssertNil(outbox.blobData(reportId: "a", index: 9), "the dropped bytes are gone from disk")
+        XCTAssertEqual(outbox.trimAttachments(reportId: "a"), [], "a trimmed entry has nothing more to drop")
+    }
+
+    func testTrimAttachmentsLeavesAnEntryWithinTheLimitAlone() throws {
+        let outbox = FeedbackOutbox(directory: dir)
+        try outbox.enqueue(report(id: "a", time: "t1"), blobs: (0..<10).map { _ in blob(16, kind: .file) })
+        XCTAssertEqual(outbox.trimAttachments(reportId: "a"), [])
+        XCTAssertEqual(outbox.entry(reportId: "a")?.blobs.count, 10)
+        XCTAssertEqual(outbox.trimAttachments(reportId: "gone"), [])
+    }
+
     func testRemoveDeletesPendingBlobsToo() throws {
         let outbox = FeedbackOutbox(directory: dir)
         try outbox.enqueue(report(id: "a", time: "t1"), blobs: [blob(64)])
@@ -424,6 +470,43 @@ final class FeedbackOutboxTests: XCTestCase {
         XCTAssertEqual(outbox.pendingReportIds(), ["a", "b"])
         try outbox.enqueue(report(id: "c", time: "2026-01-03"))
         XCTAssertEqual(outbox.pending().map(\.report.reportId), ["c"], "maxEntries = 1")
+    }
+
+    /// The caps tell the caller what they evicted, so every report gets its final outcome:
+    /// whether its report had reached the server, and if so, how many of its attachments never
+    /// uploaded (no receipt, bytes still on disk).
+    func testEnqueueReturnsTheEntriesTheCapsEvicted() throws {
+        let outbox = FeedbackOutbox(directory: dir, maxEntries: 2)
+        XCTAssertEqual(try outbox.enqueue(report(id: "a", time: "2026-01-01"), blobs: [blob(16), blob(16), blob(16)]), [])
+        XCTAssertEqual(try outbox.enqueue(report(id: "b", time: "2026-01-02"), blobs: [blob(16)]), [])
+        // "a" reached the server once; one of its three attachments uploaded.
+        outbox.recordAttachmentAttempt(reportId: "a")
+        outbox.markUploaded(reportId: "a", blobIndex: 0, attachment: uploadedRef)
+
+        XCTAssertEqual(
+            try outbox.enqueue(report(id: "c", time: "2026-01-03")),
+            [OutboxEviction(reportId: "a", reportDelivered: true, missingAttachments: 2)]
+        )
+        XCTAssertEqual(
+            try outbox.enqueue(report(id: "d", time: "2026-01-04")),
+            [OutboxEviction(reportId: "b", reportDelivered: false, missingAttachments: 0)]
+        )
+        XCTAssertEqual(outbox.pendingReportIds(), ["c", "d"])
+    }
+
+    /// A delivered entry whose every blob uploaded is still queued only because the server
+    /// stored fewer references than were listed, a count the outbox doesn't keep. It reports
+    /// at least one missing attachment, never zero.
+    func testAnEvictedDeliveredEntryWithEveryBlobUploadedStillMissesOne() throws {
+        let outbox = FeedbackOutbox(directory: dir, maxEntries: 1)
+        try outbox.enqueue(report(id: "a", time: "2026-01-01"), blobs: [blob(16)])
+        outbox.markUploaded(reportId: "a", blobIndex: 0, attachment: uploadedRef)
+        outbox.recordAttachmentAttempt(reportId: "a")
+
+        XCTAssertEqual(
+            try outbox.enqueue(report(id: "b", time: "2026-01-02")),
+            [OutboxEviction(reportId: "a", reportDelivered: true, missingAttachments: 1)]
+        )
     }
 
     func testHoldIsExclusiveAndReleaseGivesItBack() throws {

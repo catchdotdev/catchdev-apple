@@ -35,6 +35,9 @@ final class ReporterViewController: UIViewController {
     private var severity: Severity?
     private var area: String?
     private var attachments: [PendingAttachment] = []
+    /// Picked files still being read off disk. They count toward the attachment limit, so a
+    /// second pick made during a slow (iCloud) read can't take the report past it.
+    private var fileReadsInFlight = 0
     private var excluded: Set<DiagnosticID> = []
     private var isStartingRecording = false
     // Snapshot the global toggle once per presentation so `buildBody` (shows the field) and
@@ -415,8 +418,14 @@ final class ReporterViewController: UIViewController {
         present(picker, animated: true)
     }
 
+    /// Whether the report already holds as many attachments as it can carry
+    /// (``AttachmentLimits/maxPerReport``, the screenshot included).
+    private var isAttachmentLimitReached: Bool {
+        attachments.count + fileReadsInFlight >= AttachmentLimits.maxPerReport
+    }
+
     private func refreshAttachments() {
-        attachmentsView.setAttachments(attachments)
+        attachmentsView.setAttachments(attachments, limitReached: isAttachmentLimitReached)
     }
 
     // MARK: - Attachments
@@ -432,7 +441,7 @@ final class ReporterViewController: UIViewController {
     private func annotatePrimaryScreenshot() {
         if let index = attachments.firstIndex(where: { $0.kind == .screenshot }) {
             annotate(at: index)
-        } else if let original = originalScreenshot {
+        } else if let original = originalScreenshot, !isAttachmentLimitReached {
             seedScreenshot(original)
             refreshAttachments()
             if let index = attachments.firstIndex(where: { $0.kind == .screenshot }) { annotate(at: index) }
@@ -466,6 +475,7 @@ final class ReporterViewController: UIViewController {
     }
 
     private func pickFile() {
+        guard !isAttachmentLimitReached else { return }
         let picker = UIDocumentPickerViewController(forOpeningContentTypes: [.item])
         picker.delegate = self
         picker.allowsMultipleSelection = false
@@ -621,7 +631,7 @@ final class ReporterViewController: UIViewController {
         // Debounce: the reporter stays up during ReplayKit's async start, so a second tap
         // could double-start the recorder (→ two Stop pills, or a lost draft when the second
         // start fails and clears pendingRestore mid-recording).
-        guard !isStartingRecording else { return }
+        guard !isStartingRecording, !isAttachmentLimitReached else { return }
         isStartingRecording = true
         currentDraft = descriptionTextView.text ?? ""
         ReporterViewController.pendingRestore = ReporterRestoreState(
@@ -732,6 +742,9 @@ extension ReporterViewController: UIDocumentPickerDelegate {
         // Read off the main thread and bounded: the picker allows any item, and
         // an un-materialised iCloud file blocks on a network fetch. Reading one
         // byte past the cap is what detects a file whose declared size lied.
+        // Until it lands, the read holds its place toward the attachment limit.
+        fileReadsInFlight += 1
+        refreshAttachments()
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             let scoped = url.startAccessingSecurityScopedResource()
             let data = AttachmentLimits.readCapped(url: url, limit: cap + 1)
@@ -739,6 +752,8 @@ extension ReporterViewController: UIDocumentPickerDelegate {
 
             DispatchQueue.main.async {
                 guard let self else { return }
+                self.fileReadsInFlight -= 1
+                defer { self.refreshAttachments() }
                 guard let data else {
                     self.showAttachmentUnreadable()
                     return
@@ -750,7 +765,6 @@ extension ReporterViewController: UIDocumentPickerDelegate {
                 self.attachments.append(PendingAttachment(
                     kind: .file, data: data, contentType: contentType, filename: filename
                 ))
-                self.refreshAttachments()
             }
         }
     }
@@ -771,6 +785,41 @@ extension ReporterViewController: UIDocumentPickerDelegate {
         )
         alert.addAction(UIAlertAction(title: "OK", style: .default))
         present(alert, animated: true)
+    }
+}
+
+/// Test seam for the app-hosted unit tests: the package's own `swift test` target is
+/// Foundation-only (macOS) and cannot see UIKit, so the reporter's attachment limit is only
+/// reachable from the example app's unit tests.
+@_spi(CatchDevTesting)
+public enum CatchDevReporterTesting {
+    /// A reporter reopened with `count` attachments, as after a recording: a screenshot first
+    /// when `screenshot` is set, then files.
+    public static func makeReporter(attachments count: Int, screenshot: Bool) -> UIViewController {
+        let attachments = (0..<count).map { index in
+            screenshot && index == 0
+                ? PendingAttachment(
+                    kind: .screenshot, data: Data([0xFF, 0xD8]), contentType: "image/jpeg",
+                    filename: "screenshot.jpg", thumbnail: UIImage()
+                )
+                : PendingAttachment(
+                    kind: .file, data: Data([UInt8(index)]), contentType: "text/plain",
+                    filename: "file-\(index).txt"
+                )
+        }
+        return ReporterViewController(restoring: ReporterRestoreState(
+            drafts: [:], tab: .feedback, severity: nil, area: nil, contact: "", excluded: [],
+            attachments: attachments, screenName: nil, reportId: "reporter-testing",
+            droppedRecordingReason: nil
+        ))
+    }
+
+    /// Hand `reporter` (from ``makeReporter(attachments:screenshot:)``) a file, as the document
+    /// picker does. Its bytes are read in the background, as for a real pick.
+    public static func pick(_ url: URL, in reporter: UIViewController) {
+        (reporter as? ReporterViewController)?.documentPicker(
+            UIDocumentPickerViewController(forOpeningContentTypes: [.item]), didPickDocumentsAt: [url]
+        )
     }
 }
 #endif

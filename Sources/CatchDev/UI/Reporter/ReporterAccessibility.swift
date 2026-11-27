@@ -45,6 +45,8 @@ public enum CatchDevReporterAccessibility {
     public static func attachmentEdit(_ index: Int) -> String {
         "catchdev.reporter.attachment.edit.\(index)"
     }
+    /// The "Up to 10 attachments" hint, shown once the report has as many as it can carry.
+    public static let attachmentLimit = "catchdev.reporter.attachments.limit"
 
     // Diagnostics disclosure
     public static let diagnosticsHeader = "catchdev.reporter.diagnostics"

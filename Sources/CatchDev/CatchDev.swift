@@ -71,6 +71,30 @@ public final class CatchDev: NSObject {
         static let standard = AttachmentRetryLimits(maxAttempts: 5, maxAge: 7 * 24 * 60 * 60)
     }
 
+    /// How long a flush leaves an entry alone after an attempt that reached the server but left
+    /// attachments missing: 60 s after the first such attempt, doubling with each one, at most
+    /// 6 h. **Shared verbatim with the Android SDK — keep the two identical.**
+    ///
+    /// It only spaces the retries out; ``AttachmentRetryLimits`` still decides when to give up.
+    /// The wait runs from the last counted attempt (``FeedbackOutbox/lastAttachmentAttempt(reportId:)``),
+    /// so a relaunch doesn't reset it. There is no timer: an entry still waiting is skipped by
+    /// the flushes (launch, reconnect, foreground) that come before its time, and the first flush
+    /// after it retries it. An entry with no counted attempt never waits.
+    struct AttachmentRetryBackoff {
+        var initialDelay: TimeInterval
+        var maxDelay: TimeInterval
+
+        static let standard = AttachmentRetryBackoff(initialDelay: 60, maxDelay: 6 * 60 * 60)
+
+        /// The wait after `attempts` counted attempts: min(initialDelay × 2^(attempts − 1), maxDelay).
+        func delay(afterAttempts attempts: Int) -> TimeInterval {
+            guard attempts >= 1 else { return 0 }
+            // 2^30 × 60 s is centuries, far past any cap, so stopping there keeps the shift safe.
+            let doublings = min(attempts - 1, 30)
+            return min(initialDelay * Double(1 << doublings), maxDelay)
+        }
+    }
+
     /// One attachment whose upload failed in this attempt: it stays pending for the next one.
     struct AttachmentFailure {
         let blob: OutboxBlob
@@ -124,6 +148,13 @@ public final class CatchDev: NSObject {
     private let reachabilityEnabled: Bool
     /// When to stop retrying attachments that won't upload.
     private let attachmentRetryLimits: AttachmentRetryLimits
+    /// How long to wait between those retries.
+    private let attachmentRetryBackoff: AttachmentRetryBackoff
+    /// The SDK's clock for the attachment retries (the backoff and the give-up age). Injectable
+    /// so tests can move time forward.
+    private let now: () -> Date
+    /// Where ``warn(_:)`` lines go: `NSLog` in production, captured by tests.
+    private let warningLog: (String) -> Void
 
     /// Serial queue for the SDK's own outbox work: the whole flush drain, and every read/write a
     /// delivery makes (reading a blob's 25–40 MB back off disk, recording an upload's receipt,
@@ -180,6 +211,9 @@ public final class CatchDev: NSObject {
         self.outbox = FeedbackOutbox.defaultDirectory().map { FeedbackOutbox(directory: $0) }
         self.reachabilityEnabled = true
         self.attachmentRetryLimits = .standard
+        self.attachmentRetryBackoff = .standard
+        self.now = { Date() }
+        self.warningLog = { CatchDev.warn($0) }
         super.init()
     }
 
@@ -192,13 +226,19 @@ public final class CatchDev: NSObject {
         uploader: AttachmentUploader = AttachmentUploader(),
         outbox: FeedbackOutbox? = nil,
         monitorReachability: Bool = false,
-        attachmentRetryLimits: AttachmentRetryLimits = .standard
+        attachmentRetryLimits: AttachmentRetryLimits = .standard,
+        attachmentRetryBackoff: AttachmentRetryBackoff = .standard,
+        now: @escaping () -> Date = { Date() },
+        warningLog: @escaping (String) -> Void = { CatchDev.warn($0) }
     ) {
         self.client = client
         self.uploader = uploader
         self.outbox = outbox
         self.reachabilityEnabled = monitorReachability
         self.attachmentRetryLimits = attachmentRetryLimits
+        self.attachmentRetryBackoff = attachmentRetryBackoff
+        self.now = now
+        self.warningLog = warningLog
         super.init()
     }
 
@@ -349,14 +389,16 @@ public final class CatchDev: NSObject {
     /// - `.success(id)`: the report and every attachment reached catch.dev; `id` is the
     ///   server's id for the report.
     /// - `.failure(CatchDevAttachmentsNotDelivered)`: the report reached catch.dev (its
-    ///   `reportId` is in the error), but some attachments never uploaded before the retry
-    ///   limits ran out.
+    ///   `reportId` is in the error), but some attachments never did: they ran out of retries,
+    ///   or the outbox filled up while they waited (`underlyingError` is `CatchDevOutboxFull`).
+    /// - `.failure(CatchDevOutboxFull)`: the report was still waiting to be sent when the
+    ///   outbox filled up, and was dropped to make room for a newer one.
     /// - `.failure(CatchDevError)`: the report was not delivered (rejected by the server, or
     ///   the SDK was not started).
     ///
     /// A submission that is still waiting in the outbox — offline, or with attachments still
     /// retrying — has no outcome yet, so the callback fires later, from the flush that
-    /// settles it.
+    /// settles it (or from the submission whose room evicts it).
     public static var onFeedbackSent: ((Result<String, Error>) -> Void)? {
         get { shared.onFeedbackSent }
         set { shared.onFeedbackSent = newValue }
@@ -440,7 +482,6 @@ public final class CatchDev: NSObject {
         report.environment = environment
         report.screenName = screenName
         report.breadcrumbs = breadcrumbs
-        report.attachments = attachments
         report.imageData = imageData
         report.applyDeviceContext()
 
@@ -463,6 +504,13 @@ public final class CatchDev: NSObject {
         }
 
         let reportId = report.reportId
+
+        // At most `AttachmentLimits.maxPerReport` attachments, trimmed BEFORE anything is
+        // persisted: an entry never holds, lists or waits for more than the server keeps.
+        let (keptRefs, keptBlobs) = fitAttachments(
+            refs: attachments, blobs: pendingAttachments, reportId: reportId
+        )
+        report.attachments = keptRefs
 
         // 1. PERSIST FIRST — report + every attachment's bytes, before any network call, and
         // SYNCHRONOUSLY, on the caller's thread, before `submit` returns.
@@ -490,9 +538,14 @@ public final class CatchDev: NSObject {
                 return
             }
             do {
-                try outbox.enqueue(report, blobs: pendingAttachments)
+                let evicted = try outbox.enqueue(report, blobs: keptBlobs)
                 queuedDurably = true
                 holding = true
+                // Making room cost older reports their place. Each gets its final outcome now,
+                // because no flush will ever see it again.
+                for eviction in evicted {
+                    notifyFeedbackSent(.failure(Self.failure(evictedFrom: eviction)))
+                }
             } catch {
                 // Persistence failed (disk full): fall back to a best-effort in-memory send —
                 // and there is nothing on disk left to claim.
@@ -520,15 +573,15 @@ public final class CatchDev: NSObject {
             } else {
                 deliveryReport = report
                 // Descriptors mirror what `enqueue` would have written (index = position).
-                blobs = pendingAttachments.enumerated().map { index, blob in
+                blobs = keptBlobs.enumerated().map { index, blob in
                     OutboxBlob(
                         index: index, kind: blob.kind, contentType: blob.contentType,
                         filename: blob.filename, annotated: blob.annotated, size: blob.data.count
                     )
                 }
                 loadBlob = { descriptor in
-                    pendingAttachments.indices.contains(descriptor.index)
-                        ? pendingAttachments[descriptor.index].data
+                    keptBlobs.indices.contains(descriptor.index)
+                        ? keptBlobs[descriptor.index].data
                         : nil
                 }
             }
@@ -570,6 +623,45 @@ public final class CatchDev: NSObject {
                 }
             }
         }
+    }
+
+    /// Trim one submission to ``AttachmentLimits/maxPerReport`` attachments, by the Android SDK's
+    /// rule: references the caller already uploaded keep their place (they come first on the
+    /// wire), and the blobs share the room left, screenshots first. The reporter never offers
+    /// more; this catches every other path. Each dropped attachment is logged, even with debug
+    /// logging off.
+    private func fitAttachments(
+        refs: [Attachment], blobs: [PendingBlob], reportId: String
+    ) -> (refs: [Attachment], blobs: [PendingBlob]) {
+        let keptRefs = Array(refs.prefix(AttachmentLimits.maxPerReport))
+        let (keptBlobs, droppedBlobs) = AttachmentLimits.split(
+            blobs, limit: AttachmentLimits.maxPerReport - keptRefs.count
+        ) { $0.kind == .screenshot }
+        for ref in refs.dropFirst(keptRefs.count) {
+            warnDroppedOverLimit(reportId: reportId, kind: ref.kind, size: ref.size)
+        }
+        for blob in droppedBlobs {
+            warnDroppedOverLimit(reportId: reportId, kind: blob.kind, size: blob.data.count)
+        }
+        return (keptRefs, keptBlobs)
+    }
+
+    private func warnDroppedOverLimit(reportId: String, kind: AttachmentKind, size: Int) {
+        warn(
+            "report \(reportId) has more than \(AttachmentLimits.maxPerReport) attachments, the most "
+                + "the server keeps: dropped a \(kind.rawValue) attachment (\(size) bytes)"
+        )
+    }
+
+    /// The final outcome of a report the outbox evicted to stay under its caps: the whole
+    /// report is lost (``CatchDevOutboxFull``), or, if it had already reached the server, only
+    /// its missing attachments (``CatchDevAttachmentsNotDelivered``, caused by the full outbox).
+    static func failure(evictedFrom eviction: OutboxEviction) -> Error {
+        let full = CatchDevOutboxFull(reportId: eviction.reportId)
+        guard eviction.reportDelivered else { return full }
+        return CatchDevAttachmentsNotDelivered(
+            reportId: eviction.reportId, missingCount: eviction.missingAttachments, underlyingError: full
+        )
     }
 
     /// Deliver one submission: upload every still-pending attachment (persisting each
@@ -659,9 +751,9 @@ public final class CatchDev: NSObject {
         let missing = failures.count + unconfirmed
         var attempts = 1
         if let outbox {
-            attempts = outbox.recordAttachmentAttempt(reportId: report.reportId)
+            attempts = outbox.recordAttachmentAttempt(reportId: report.reportId, at: now())
             // An unreadable `time` counts as old enough, so the attempt limit alone bounds it.
-            let age = Timestamp.date(from: report.time).map { Date().timeIntervalSince($0) } ?? .infinity
+            let age = Timestamp.date(from: report.time).map { now().timeIntervalSince($0) } ?? .infinity
             guard attempts >= attachmentRetryLimits.maxAttempts, age >= attachmentRetryLimits.maxAge else {
                 log("report \(id) reached the server; \(missing) attachment(s) still missing after attempt \(attempts) — kept for the next flush")
                 return .attachmentsPending(id: id)
@@ -779,8 +871,9 @@ public final class CatchDev: NSObject {
     /// Drain the outbox, oldest first, delivering each queued entry (uploading any
     /// attachment bytes it still carries, then posting the report). Delivered and
     /// permanently-rejected entries are removed; an entry whose report landed but whose
-    /// attachments didn't stays for the next flush, and the drain moves on; on a transport
-    /// failure (still offline) it stops and leaves the rest queued.
+    /// attachments didn't stays for the next flush, and the drain moves on (and skips it while
+    /// its ``AttachmentRetryBackoff`` runs); on a transport failure (still offline) it stops and
+    /// leaves the rest queued.
     ///
     /// Two latches keep this correct: `isFlushing` serializes flush-vs-flush (launch,
     /// reconnect, foreground can all fire at once), and the per-entry delivery claim
@@ -834,11 +927,23 @@ public final class CatchDev: NSObject {
             }
         }
 
+        // Its report already landed but attachments keep failing, and its backoff hasn't run out:
+        // skip it rather than stop on it, so it never holds back the entries queued behind it.
+        if let retryAt = nextAttachmentRetry(of: reportId), now() < retryAt {
+            log("flush: \(reportId) retries its attachments after \(retryAt) — skipped")
+            advance()
+            return
+        }
         // `submit` is delivering this entry right now — leave it alone.
         guard beginDelivery(of: reportId) else {
             log("flush: \(reportId) is already being delivered — skipped")
             advance()
             return
+        }
+        // An entry queued by an SDK version without the attachment limit can list more than the
+        // server keeps; trim it now, or the extra attachments are retried until the give-up.
+        for blob in outbox.trimAttachments(reportId: reportId) {
+            warnDroppedOverLimit(reportId: reportId, kind: blob.kind, size: blob.size)
         }
         // Re-read from disk: since the snapshot, the entry may have been delivered, evicted,
         // or had attachment references appended by the submit that owns it.
@@ -875,6 +980,16 @@ public final class CatchDev: NSObject {
                 self.withLock { $0.isFlushing = false }
             }
         }
+    }
+
+    /// When a flush may next retry the attachments of an entry whose report already reached the
+    /// server: its last counted attempt plus ``AttachmentRetryBackoff``. `nil` when nothing holds
+    /// it back, as for an entry with no counted attempt.
+    func nextAttachmentRetry(of reportId: String) -> Date? {
+        guard let outbox else { return nil }
+        let attempts = outbox.attachmentAttempts(reportId: reportId)
+        guard attempts >= 1, let last = outbox.lastAttachmentAttempt(reportId: reportId) else { return nil }
+        return last.addingTimeInterval(attachmentRetryBackoff.delay(afterAttempts: attempts))
     }
 
     /// Claim exclusive delivery of one outbox entry; `false` means another path already holds
@@ -960,7 +1075,7 @@ public final class CatchDev: NSObject {
     /// Logged whether or not debug logging is on. Reserved for the SDK giving up on something
     /// the user submitted, which must never happen silently.
     func warn(_ message: String) {
-        Self.warn(message)
+        warningLog(message)
     }
 
     static func warn(_ message: String) {

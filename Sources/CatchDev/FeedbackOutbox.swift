@@ -43,6 +43,21 @@ enum OutboxError: Error {
     case blobMissing
 }
 
+/// An entry the caps deleted to make room for a newer one (see
+/// ``FeedbackOutbox/enqueue(_:blobs:)``). The deliverer turns it into the report's final
+/// `onFeedbackSent` outcome.
+struct OutboxEviction: Equatable {
+    let reportId: String
+    /// The report itself had reached the server (an attempt was counted), so only its missing
+    /// attachments are lost. `false` means the whole report is lost.
+    let reportDelivered: Bool
+    /// For a delivered report, its attachments whose bytes never uploaded, and at least 1: it
+    /// stayed queued only because something was missing. When every blob uploaded and the
+    /// server stored fewer references than were listed, how many it lacks isn't kept on disk,
+    /// so 1 is the honest lower bound. `0` when the report itself was never delivered.
+    let missingAttachments: Int
+}
+
 /// One queued submission: the report plus every attachment that still needs uploading.
 /// Attachments already uploaded are folded into `report.attachments` (their bytes are gone
 /// from disk), so a replay only uploads what is still pending.
@@ -76,7 +91,8 @@ struct OutboxEntry {
 /// <outbox>/<reportId>/blobs/<n>.bin    # pending attachment bytes (gone once uploaded)
 /// <outbox>/<reportId>/blobs/<n>.json   # that blob's descriptor + its receipt, once uploaded
 /// <outbox>/<reportId>/screenshot.jpg   # legacy inline screenshot (`imageData`), if any
-/// <outbox>/<reportId>/attachment-attempts.json  # attempts that left attachments missing
+/// <outbox>/<reportId>/attachment-attempts.json  # attempts that left attachments missing;
+///                                               # its modification date is the last one's time
 /// ```
 ///
 /// Foundation-only and directory-injectable for testing. Every method is thread-safe.
@@ -177,12 +193,16 @@ final class FeedbackOutbox {
     /// the payload can't be written (e.g. disk full), so the caller can fall back to an
     /// in-memory send.
     ///
+    /// Returns the older entries the caps evicted to make room, so the caller can give each
+    /// report its final outcome. Nothing is evicted when the write fails.
+    ///
     /// Blocking, and deliberately so — it is called synchronously from ``CatchDev/submit`` so that
     /// the submission is durable by the time Send returns. The bytes are written **without the
     /// lock held** (they can be tens of megabytes): the id sits in `writing` for the duration,
     /// which makes the half-built folder invisible to every reader and immune to the reaper, and
     /// the entry becomes real only when `report.json` lands.
-    func enqueue(_ report: FeedbackReport, blobs: [PendingBlob] = []) throws {
+    @discardableResult
+    func enqueue(_ report: FeedbackReport, blobs: [PendingBlob] = []) throws -> [OutboxEviction] {
         let reportId = report.reportId
         let entry = directory.appendingPathComponent(reportId, isDirectory: true)
 
@@ -238,15 +258,17 @@ final class FeedbackOutbox {
 
         lock.lock()
         writing.remove(reportId) // published: the entry is now a first-class citizen of the queue
-        enforceCapacityLocked(keep: reportId)
+        let evicted = enforceCapacityLocked(keep: reportId)
         lock.unlock()
+        return evicted
     }
 
     // MARK: - Reading
 
     /// All queued entries not claimed by a delivery, oldest first. Ordered by the report's own
-    /// ISO-8601 `time` so we never read file timestamps (a "required reason" API). Blob *bytes*
-    /// are not loaded — fetch them one at a time with ``blobData(reportId:index:)``.
+    /// ISO-8601 `time`, never by file timestamps (a "required reason" API, read only for the
+    /// attachment backoff — see ``lastAttachmentAttempt(reportId:)``). Blob *bytes* are not
+    /// loaded — fetch them one at a time with ``blobData(reportId:index:)``.
     ///
     /// Treat the result as a *listing*, not as delivery input: an entry advances on disk while
     /// it is being delivered (a receipt is written, a blob's bytes are dropped), so a deliverer
@@ -353,24 +375,43 @@ final class FeedbackOutbox {
         return attachmentAttemptsLocked(reportId: reportId)
     }
 
-    /// Count one more attempt that left attachments missing, and return the new total.
+    /// Count one more attempt that left attachments missing, made at `time`, and return the new
+    /// total. `time` becomes the attempts file's modification date: when the last attempt was
+    /// counted, which the attachment backoff waits from (``lastAttachmentAttempt(reportId:)``).
     ///
     /// A failed write (disk full) is deliberately not an error: the count simply does not
     /// advance on disk, which can only make the SDK retry longer, never give up early. An
     /// entry that is no longer on disk gets no file — writing one would leave a folder with no
     /// `report.json` behind, for the reaper to find.
     @discardableResult
-    func recordAttachmentAttempt(reportId: String) -> Int {
+    func recordAttachmentAttempt(reportId: String, at time: Date = Date()) -> Int {
         lock.lock(); defer { lock.unlock() }
         let entry = directory.appendingPathComponent(reportId, isDirectory: true)
         let attempts = attachmentAttemptsLocked(reportId: reportId) + 1
         guard fileManager.fileExists(atPath: entry.appendingPathComponent("report.json").path) else {
             return attempts
         }
-        if let data = try? JSONEncoder().encode(AttachmentAttempts(count: attempts)) {
-            try? writeFile(data, entry.appendingPathComponent(Self.attachmentAttemptsFile))
+        let file = attachmentAttemptsURL(reportId)
+        if let data = try? JSONEncoder().encode(AttachmentAttempts(count: attempts)),
+           (try? writeFile(data, file)) != nil {
+            // Stamped from the SDK's clock rather than left to the write, so the backoff reads
+            // back the same clock it compares against (the Android SDK does the same).
+            try? fileManager.setAttributes([.modificationDate: time], ofItemAtPath: file.path)
         }
         return attempts
+    }
+
+    /// When the last attempt that left attachments missing was counted: the modification date
+    /// of the attempts file, which only ``recordAttachmentAttempt(reportId:at:)`` writes. `nil`
+    /// when no attempt was counted. The attachment backoff waits from this time. Being the file's
+    /// own date, it survives a relaunch with no new file format.
+    ///
+    /// Reading a file's modification date is a "required reason" API: `PrivacyInfo.xcprivacy`
+    /// declares it with reason C617.1 (a file inside the app's own container).
+    func lastAttachmentAttempt(reportId: String) -> Date? {
+        lock.lock(); defer { lock.unlock() }
+        let attributes = try? fileManager.attributesOfItem(atPath: attachmentAttemptsURL(reportId).path)
+        return attributes?[.modificationDate] as? Date
     }
 
     /// On-disk shape of `attachment-attempts.json`.
@@ -380,15 +421,48 @@ final class FeedbackOutbox {
 
     private static let attachmentAttemptsFile = "attachment-attempts.json"
 
-    private func attachmentAttemptsLocked(reportId: String) -> Int {
-        let url = directory
+    private func attachmentAttemptsURL(_ reportId: String) -> URL {
+        directory
             .appendingPathComponent(reportId, isDirectory: true)
             .appendingPathComponent(Self.attachmentAttemptsFile)
+    }
+
+    private func attachmentAttemptsLocked(reportId: String) -> Int {
         guard
-            let data = try? Data(contentsOf: url),
+            let data = try? Data(contentsOf: attachmentAttemptsURL(reportId)),
             let attempts = try? JSONDecoder().decode(AttachmentAttempts.self, from: data)
         else { return 0 }
         return max(0, attempts.count)
+    }
+
+    // MARK: - Attachment limit
+
+    /// Delete the blobs of one entry that don't fit under ``AttachmentLimits/maxPerReport``,
+    /// counting the references its report already lists, and return them so the caller can say
+    /// what was dropped. Screenshots are kept first, then the lowest indices.
+    ///
+    /// Only an entry queued by an SDK version without the limit (0.1.2 or older) can have more:
+    /// ``CatchDev`` trims a submission before it is persisted. Left alone, such an entry would
+    /// retry the extra attachments until the give-up, because the server never stores them.
+    ///
+    /// Call it only while holding the entry (``hold(_:)``): it deletes blobs a delivery reads.
+    func trimAttachments(reportId: String) -> [OutboxBlob] {
+        lock.lock(); defer { lock.unlock() }
+        let entry = directory.appendingPathComponent(reportId, isDirectory: true)
+        guard
+            let data = try? Data(contentsOf: entry.appendingPathComponent("report.json")),
+            let report = try? JSONDecoder().decode(FeedbackReport.self, from: data)
+        else { return [] }
+        let room = AttachmentLimits.maxPerReport - report.attachments.count
+        let (_, dropped) = AttachmentLimits.split(descriptorsLocked(at: entry), limit: room) {
+            $0.kind == .screenshot
+        }
+        let blobs = entry.appendingPathComponent("blobs", isDirectory: true)
+        for blob in dropped {
+            try? fileManager.removeItem(at: blobs.appendingPathComponent("\(blob.index).bin"))
+            try? fileManager.removeItem(at: blobs.appendingPathComponent("\(blob.index).json"))
+        }
+        return dropped
     }
 
     /// Remove an entry and everything under it: delivered, permanently rejected, or given up on
@@ -543,8 +617,8 @@ final class FeedbackOutbox {
     }
 
     /// What one entry occupies on disk, all files under its folder. `.fileSizeKey` is a size, not
-    /// a timestamp — no "required reason" API is involved (which is why the outbox may not sort by
-    /// file dates, but may do this). Metadata only: the files are never read.
+    /// a timestamp, so no "required reason" API is involved. Metadata only: the files are never
+    /// read.
     private func directorySizeLocked(at entry: URL) -> Int {
         guard let files = fileManager.enumerator(
             at: entry, includingPropertiesForKeys: [.fileSizeKey, .isRegularFileKey]
@@ -584,25 +658,38 @@ final class FeedbackOutbox {
     /// the worst bug this queue can have — the deliverer finds the blob gone, POSTs the report
     /// with an empty `attachments` array, and the 2xx ack makes the loss permanent. A pinned
     /// entry is skipped, not stopped on: the sweep moves to the next-oldest and keeps going.
-    private func enforceCapacityLocked(keep: String?) {
+    ///
+    /// Returns every entry it evicted, oldest first, for the caller to report.
+    private func enforceCapacityLocked(keep: String?) -> [OutboxEviction] {
         var headers = sortedHeadersLocked() // oldest first; also reaps half-written entries
+        var evicted: [OutboxEviction] = []
 
         func isPinned(_ header: EntryHeader) -> Bool {
             header.reportId == keep || held.contains(header.reportId)
         }
         func evict(at index: Int) {
             let victim = headers.remove(at: index)
+            let folder = directory.appendingPathComponent(victim.reportId, isDirectory: true)
             // Never silent. An entry with recorded attachment attempts already had its report
             // acked, so only its unsent attachments are lost; any other entry loses the report.
             let delivered = attachmentAttemptsLocked(reportId: victim.reportId) > 0
-            try? fileManager.removeItem(
-                at: directory.appendingPathComponent(victim.reportId, isDirectory: true)
-            )
+            // The blobs still waiting to upload: no receipt, bytes still on disk.
+            let blobs = folder.appendingPathComponent("blobs", isDirectory: true)
+            let neverUploaded = descriptorsLocked(at: folder).filter {
+                $0.attachment == nil
+                    && fileManager.fileExists(atPath: blobs.appendingPathComponent("\($0.index).bin").path)
+            }.count
+            try? fileManager.removeItem(at: folder)
             CatchDev.warn(
                 delivered
                     ? "outbox full: gave up on the attachments of report \(victim.reportId) (the report itself was delivered)"
                     : "outbox full: dropped report \(victim.reportId) before it could be delivered"
             )
+            evicted.append(OutboxEviction(
+                reportId: victim.reportId,
+                reportDelivered: delivered,
+                missingAttachments: delivered ? max(1, neverUploaded) : 0
+            ))
         }
 
         // 1. Count cap — always.
@@ -628,7 +715,7 @@ final class FeedbackOutbox {
         let floor = pinned.isEmpty
             ? (headers.last?.byteCost ?? 0)
             : pinned.reduce(0) { $0 + $1.byteCost }
-        guard floor <= maxBytes else { return }
+        guard floor <= maxBytes else { return evicted }
 
         var total = headers.reduce(0) { $0 + $1.byteCost }
         index = 0
@@ -640,5 +727,6 @@ final class FeedbackOutbox {
             total -= headers[index].byteCost
             evict(at: index)
         }
+        return evicted
     }
 }

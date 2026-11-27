@@ -81,4 +81,51 @@ final class AttachmentLimitsTests: XCTestCase {
         XCTAssertEqual(AttachmentLimits.humanReadable(AttachmentLimits.maxFileBytes), "25 MB")
         XCTAssertEqual(AttachmentLimits.humanReadable(AttachmentLimits.maxRecordingBytes), "50 MB")
     }
+
+    // MARK: - Per-report count
+
+    /// The backend stores the first 10 references a report lists (`MAX_ATTACHMENTS`); an 11th
+    /// would be retried until the give-up and the submission reported as not delivered.
+    func testTheCountCapMatchesTheBackend() {
+        XCTAssertEqual(AttachmentLimits.maxPerReport, 10)
+    }
+
+    private func isShot(_ name: String) -> Bool { name.hasPrefix("shot") }
+
+    func testSplitKeepsEverythingAtOrUnderTheLimit() {
+        let files = (1...10).map { "file\($0)" }
+        let (kept, dropped) = AttachmentLimits.split(files, isScreenshot: isShot)
+        XCTAssertEqual(kept, files)
+        XCTAssertTrue(dropped.isEmpty)
+    }
+
+    func testSplitDropsTheLastOnesPastTheLimit() {
+        let items = ["shot"] + (1...11).map { "file\($0)" }
+        let (kept, dropped) = AttachmentLimits.split(items, isScreenshot: isShot)
+        XCTAssertEqual(kept, ["shot"] + (1...9).map { "file\($0)" })
+        XCTAssertEqual(dropped, ["file10", "file11"])
+    }
+
+    /// Screenshots take the slots first: one that comes last is still kept, at the cost of the
+    /// last other attachment, and is listed first.
+    func testSplitKeepsAScreenshotEvenWhenItComesLast() {
+        let items = (1...10).map { "file\($0)" } + ["shot"]
+        let (kept, dropped) = AttachmentLimits.split(items, isScreenshot: isShot)
+        XCTAssertEqual(kept, ["shot"] + (1...9).map { "file\($0)" })
+        XCTAssertEqual(dropped, ["file10"])
+    }
+
+    /// The same order as the Android SDK even when nothing is dropped: a screenshot the user
+    /// removed and added back is listed first.
+    func testSplitListsTheScreenshotFirstUnderTheLimitToo() {
+        let (kept, dropped) = AttachmentLimits.split(["file1", "file2", "shot"], isScreenshot: isShot)
+        XCTAssertEqual(kept, ["shot", "file1", "file2"])
+        XCTAssertTrue(dropped.isEmpty)
+    }
+
+    func testSplitWithNoRoomDropsEverything() {
+        let (kept, dropped) = AttachmentLimits.split(["shot", "file1"], limit: 0, isScreenshot: isShot)
+        XCTAssertTrue(kept.isEmpty)
+        XCTAssertEqual(dropped, ["shot", "file1"])
+    }
 }
