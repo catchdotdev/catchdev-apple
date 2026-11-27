@@ -25,11 +25,14 @@ jobs:
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
+      # A generic destination compiles for the simulator SDK without needing a simulator
+      # device. A named device ("iPhone 16") breaks whenever the runner image stops
+      # shipping that device or its runtime.
       - name: Build for iOS Simulator
         run: |
           xcodebuild build \
             -scheme CatchDev \
-            -destination 'platform=iOS Simulator,name=iPhone 16,OS=latest' \
+            -destination 'generic/platform=iOS Simulator' \
             -skipMacroValidation \
             CODE_SIGNING_ALLOWED=NO
 
