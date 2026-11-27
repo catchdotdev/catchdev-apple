@@ -222,4 +222,4 @@ exercised on the iOS Simulator in CI. See `Examples/` for a runnable sample app.
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+Apache-2.0 — see [LICENSE](LICENSE).
